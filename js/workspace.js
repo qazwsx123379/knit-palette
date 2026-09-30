@@ -5,6 +5,7 @@ import { recolor, paintRegions } from './recolor.js';
 import { labToHex, hexToRgb, deltaE } from './color.js';
 import { openPicker, swatchVisual } from './library.js';
 import { openExport } from './export.js';
+import { loadSam, analyzeImage, selectByPoints } from './sam.js';
 
 const WORK_MAX = 1100; // 作品圖的處理尺寸（長邊像素）
 const DEFAULT_SENS = 55;
@@ -35,6 +36,7 @@ export function createWorkspace(app) {
       selected: null,
       brush: { on: false, size: 30, smart: true },
       wand: false,
+      ai: { on: false, handle: null, points: [], mask: null, include: true, busy: false },
       tol: 14, // 智慧筆刷、魔術棒的顏色容許範圍
       showRegions: false,
       hold: false,
@@ -271,7 +273,7 @@ export function createWorkspace(app) {
 
   function renderCanvas() {
     if (!S || !ctx) return;
-    const showRegions = S.mode === 'detect' && (S.showRegions || S.brush.on || S.wand);
+    const showRegions = S.mode === 'detect' && (S.showRegions || S.brush.on || S.wand || S.ai.on);
     if (showRegions) {
       const colors = {};
       for (const g of S.groups) colors[g.id] = hexToRgb(regionColor(g));
@@ -282,6 +284,43 @@ export function createWorkspace(app) {
       outImage.data.set(S.prep.rgba);
     }
     ctx.putImageData(outImage, 0, 0);
+    if (S.mode === 'detect' && S.ai.on) drawAiOverlay();
+  }
+
+  // AI 圈選的預覽：選到的範圍蓋一層半透明，點過的地方畫圓點（綠色加入、紅色排除）
+  function drawAiOverlay() {
+    const { mask, points } = S.ai;
+    if (mask) {
+      const ov = ctx.getImageData(0, 0, S.w, S.h);
+      const d = ov.data;
+      for (let i = 0; i < mask.length; i++) {
+        if (!mask[i]) continue;
+        const o = i * 4;
+        d[o] = d[o] * 0.45 + 255 * 0.55;
+        d[o + 1] = d[o + 1] * 0.45 + 60 * 0.55;
+        d[o + 2] = d[o + 2] * 0.45 + 170 * 0.55;
+      }
+      // 選取範圍的外框
+      for (let y = 1; y < S.h - 1; y++) {
+        for (let x = 1; x < S.w - 1; x++) {
+          const i = y * S.w + x;
+          if (mask[i] && (!mask[i - 1] || !mask[i + 1] || !mask[i - S.w] || !mask[i + S.w])) {
+            d[i * 4] = 255; d[i * 4 + 1] = 255; d[i * 4 + 2] = 255;
+          }
+        }
+      }
+      ctx.putImageData(ov, 0, 0);
+    }
+    const r = Math.max(5, Math.max(S.w, S.h) * 0.009);
+    for (const p of points) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = p.include ? '#22a559' : '#d33a3a';
+      ctx.fill();
+      ctx.lineWidth = r * 0.35;
+      ctx.strokeStyle = '#ffffff';
+      ctx.stroke();
+    }
   }
 
   let rafPending = false;
@@ -293,7 +332,7 @@ export function createWorkspace(app) {
 
   function renderBadges() {
     badgesEl.replaceChildren();
-    badgesEl.classList.toggle('passive', (S.brush.on || S.wand) && S.mode === 'detect');
+    badgesEl.classList.toggle('passive', (S.brush.on || S.wand || S.ai.on) && S.mode === 'detect');
     // 數字互相重疊時，只留每種線的第一個，其餘的不顯示
     const rect = canvas.getBoundingClientRect();
     const placed = [];
@@ -384,6 +423,14 @@ export function createWorkspace(app) {
         paintTo(p0);
         return;
       }
+      if (S.ai.on && S.mode === 'detect') {
+        e.preventDefault();
+        if (!S.ai.handle) { toast('AI 還在準備中，請稍等'); return; }
+        const p0 = toImg(e);
+        S.ai.points.push({ x: clampX(p0.x), y: clampY(p0.y), include: S.ai.include });
+        runAi();
+        return;
+      }
       if (S.wand && S.mode === 'detect') {
         if (S.selected === null) { toast('先在右邊選要改成哪一種線'); return; }
         e.preventDefault();
@@ -448,6 +495,7 @@ export function createWorkspace(app) {
     S.mode = m;
     S.brush.on = false;
     S.wand = false;
+    stopAi();
     if (m === 'color') S.selected = null;
     brushCursor.hidden = true;
     refresh();
@@ -456,7 +504,7 @@ export function createWorkspace(app) {
   function groupChip(g, { onClick, selected }) {
     return h('button', { type: 'button', class: `gchip ${selected ? 'on' : ''}`, 'aria-pressed': String(!!selected), onclick: onClick },
       h('span', { class: 'gnum' }, g.n),
-      h('span', { class: 'gdot', style: { background: S.showRegions || S.brush.on || S.wand ? regionColor(g) : srcHex(g) } })
+      h('span', { class: 'gdot', style: { background: S.showRegions || S.brush.on || S.wand || S.ai.on ? regionColor(g) : srcHex(g) } })
     );
   }
 
@@ -511,9 +559,11 @@ export function createWorkspace(app) {
         button('刪除這種線', { icon: 'trash', onClick: deleteSelected, disabled: !selGroup, title: '改成背景，不換色' }),
         button('新增一種線', { icon: 'plus', onClick: addGroup }),
         button(S.brush.on ? '關閉筆刷' : '筆刷塗改', { icon: 'brush', kind: S.brush.on ? 'on' : '', onClick: toggleBrush }),
+        button(S.ai.on ? '關閉 AI 圈選' : 'AI 圈選', { icon: 'sparkle', kind: S.ai.on ? 'on' : '', onClick: toggleAi, title: '點一下要選的東西，AI 會找出它的範圍', id: 'btn-ai' }),
         button(S.wand ? '關閉魔術棒' : '魔術棒', { icon: 'wand', kind: S.wand ? 'on' : '', onClick: toggleWand, title: '點一下，把相連、顏色相近的整片改成選好的線' }),
         button('復原', { icon: 'undo', onClick: undo, disabled: !S.undo.length })
       ),
+      S.ai.on ? aiBox(target) : null,
       S.brush.on || S.wand
         ? h('div', { class: 'tool-box' },
           h('p', { class: 'small' }, S.brush.on ? `在圖上塗，塗到的地方會變成：${target}` : `點圖上的一個地方，相連又相近的顏色會變成：${target}`),
@@ -528,16 +578,106 @@ export function createWorkspace(app) {
     );
   }
 
+  // ---------- AI 圈選 ----------
+  function aiBox(target) {
+    const a = S.ai;
+    const seg = h('div', { class: 'seg', role: 'group', 'aria-label': '點選方式' },
+      h('button', { type: 'button', class: a.include ? 'on' : '', 'aria-pressed': String(a.include), onclick: () => { a.include = true; renderPanel(); } }, '加入範圍'),
+      h('button', { type: 'button', class: !a.include ? 'on' : '', 'aria-pressed': String(!a.include), onclick: () => { a.include = false; renderPanel(); } }, '排除範圍')
+    );
+    const status = !a.handle ? '準備中…' : a.busy ? 'AI 圈選中…' : a.points.length ? `已點 ${a.points.length} 個點。範圍不對就再點：選太少用「加入範圍」、選太多用「排除範圍」。` : '點圖上你要選的東西，例如花邊或絨球。';
+    return h('div', { class: 'tool-box' },
+      h('p', { class: 'small', id: 'ai-status' }, status),
+      seg,
+      h('div', { class: 'row-actions' },
+        button(`套用到：${target}`, { kind: 'primary', onClick: applyAi, disabled: !a.mask || a.busy || S.selected === null, id: 'btn-ai-apply' }),
+        button('清除重選', { kind: 'ghost', onClick: () => { a.points = []; a.mask = null; refresh(); }, disabled: !a.points.length })
+      ),
+      S.selected === null ? h('p', { class: 'small' }, '先在上面「選一種線」，選好的範圍會變成那一種線。') : null
+    );
+  }
+
+  async function toggleAi() {
+    if (S.ai.on) { stopAi(); refresh(); return; }
+    S.ai.on = true;
+    S.brush.on = false;
+    S.wand = false;
+    refresh();
+    if (S.ai.handle) return;
+    const busy = loading('下載 AI 模型…（第一次約 15 MB，之後不用再下載）');
+    try {
+      await loadSam((got, total) => busy.set(`下載 AI 模型… ${got.toFixed(1)} / ${total.toFixed(1)} MB（只有第一次需要）`));
+      busy.set('AI 正在看這張圖…（大約 5–30 秒）');
+      await nextFrame();
+      const session = S;
+      const handle = await analyzeImage(S.srcCanvas);
+      if (session !== S) { busy.close(); return; } // 等待中換了圖
+      S.ai.handle = handle;
+      busy.close();
+      refresh();
+      toast('AI 準備好了，點圖上要選的東西');
+    } catch (e) {
+      busy.close();
+      S.ai.on = false;
+      refresh();
+      toast(e.message || 'AI 圈選啟動失敗', 'error');
+    }
+  }
+
+  function stopAi() {
+    if (!S) return;
+    S.ai.on = false;
+    S.ai.points = [];
+    S.ai.mask = null;
+  }
+
+  // 連續點很快時，只算最新的那一次
+  let aiRun = 0;
+  async function runAi() {
+    const my = ++aiRun;
+    const session = S;
+    S.ai.busy = true;
+    renderPanel();
+    renderCanvas();
+    try {
+      const mask = await selectByPoints(S.ai.handle, S.ai.points);
+      if (my !== aiRun || session !== S) return;
+      S.ai.mask = mask;
+    } catch (e) {
+      if (my === aiRun) toast(e.message || 'AI 圈選失敗', 'error');
+    } finally {
+      if (my === aiRun && session === S) {
+        S.ai.busy = false;
+        refresh();
+      }
+    }
+  }
+
+  function applyAi() {
+    const { mask } = S.ai;
+    if (!mask || S.selected === null) return;
+    pushUndo();
+    let n = 0;
+    for (let i = 0; i < mask.length; i++) if (mask[i]) { S.labels[i] = S.selected; n++; }
+    S.ai.points = [];
+    S.ai.mask = null;
+    S.manual = true;
+    recompute({ keep: S.selected });
+    markDirty();
+    refresh();
+    toast(n ? '已套用。可以繼續點下一個東西' : '沒有選到任何範圍');
+  }
+
   function toggleWand() {
     S.wand = !S.wand;
-    if (S.wand) S.brush.on = false;
+    if (S.wand) { S.brush.on = false; stopAi(); }
     if (S.wand && S.selected === null) toast('先選要改成哪一種線，再點圖');
     refresh();
   }
 
   function toggleBrush() {
     S.brush.on = !S.brush.on;
-    if (S.brush.on) S.wand = false;
+    if (S.brush.on) { S.wand = false; stopAi(); }
     if (S.brush.on && S.selected === null) toast('先選要塗的線，再在圖上塗');
     refresh();
   }
