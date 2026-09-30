@@ -33,7 +33,9 @@ export function createWorkspace(app) {
       manual: false,
       mode: 'detect',
       selected: null,
-      brush: { on: false, size: 30 },
+      brush: { on: false, size: 30, smart: true },
+      wand: false,
+      tol: 14, // 智慧筆刷、魔術棒的顏色容許範圍
       showRegions: false,
       hold: false,
       undo: [],
@@ -269,7 +271,7 @@ export function createWorkspace(app) {
 
   function renderCanvas() {
     if (!S || !ctx) return;
-    const showRegions = S.mode === 'detect' && (S.showRegions || S.brush.on);
+    const showRegions = S.mode === 'detect' && (S.showRegions || S.brush.on || S.wand);
     if (showRegions) {
       const colors = {};
       for (const g of S.groups) colors[g.id] = hexToRgb(regionColor(g));
@@ -291,7 +293,7 @@ export function createWorkspace(app) {
 
   function renderBadges() {
     badgesEl.replaceChildren();
-    badgesEl.classList.toggle('passive', S.brush.on && S.mode === 'detect');
+    badgesEl.classList.toggle('passive', (S.brush.on || S.wand) && S.mode === 'detect');
     // 數字互相重疊時，只留每種線的第一個，其餘的不顯示
     const rect = canvas.getBoundingClientRect();
     const placed = [];
@@ -338,6 +340,8 @@ export function createWorkspace(app) {
       return { x: ((e.clientX - r.left) / r.width) * S.w, y: ((e.clientY - r.top) / r.height) * S.h, scale: r.width / S.w };
     };
     const radius = () => 2 + (S.brush.size / 100) * Math.max(S.w, S.h) * 0.08;
+    const clampX = (x) => Math.max(0, Math.min(S.w - 1, Math.round(x)));
+    const clampY = (y) => Math.max(0, Math.min(S.h - 1, Math.round(y)));
     let painting = false, last = null, down = null;
     const moveCursor = (e) => {
       if (!(S.brush.on && S.mode === 'detect')) { brushCursor.hidden = true; return; }
@@ -346,15 +350,20 @@ export function createWorkspace(app) {
       brushCursor.hidden = false;
       Object.assign(brushCursor.style, { width: `${d}px`, height: `${d}px`, left: `${(p.x / S.w) * 100}%`, top: `${(p.y / S.h) * 100}%` });
     };
+    let seed = null;
+    const dab = (x, y, r, target) => {
+      if (S.brush.smart && seed) Seg.paintCircleSmart(S.labels, S.prep, x, y, r, target, seed, S.tol);
+      else Seg.paintCircle(S.labels, S.w, S.h, x, y, r, target);
+    };
     const paintTo = (p) => {
       const r = radius();
       const target = S.selected;
-      if (!last) Seg.paintCircle(S.labels, S.w, S.h, p.x, p.y, r, target);
+      if (!last) dab(p.x, p.y, r, target);
       else {
         const dist = Math.hypot(p.x - last.x, p.y - last.y);
         const steps = Math.max(1, Math.ceil(dist / (r / 2)));
         for (let s = 1; s <= steps; s++) {
-          Seg.paintCircle(S.labels, S.w, S.h, last.x + ((p.x - last.x) * s) / steps, last.y + ((p.y - last.y) * s) / steps, r, target);
+          dab(last.x + ((p.x - last.x) * s) / steps, last.y + ((p.y - last.y) * s) / steps, r, target);
         }
       }
       last = p;
@@ -369,7 +378,23 @@ export function createWorkspace(app) {
         pushUndo();
         painting = true;
         last = null;
-        paintTo(toImg(e));
+        const p0 = toImg(e);
+        // 智慧筆刷的基準色：下筆那一點的顏色
+        seed = Seg.sampleLab(S.prep, clampX(p0.x), clampY(p0.y));
+        paintTo(p0);
+        return;
+      }
+      if (S.wand && S.mode === 'detect') {
+        if (S.selected === null) { toast('先在右邊選要改成哪一種線'); return; }
+        e.preventDefault();
+        const p0 = toImg(e);
+        pushUndo();
+        const n = Seg.floodSelect(S.labels, S.prep, clampX(p0.x), clampY(p0.y), S.selected, S.tol);
+        S.manual = true;
+        recompute({ keep: S.selected });
+        markDirty();
+        refresh();
+        toast(n < 50 ? '選到的範圍很小，可以把「顏色容許範圍」調大' : '已選取相近的區域');
         return;
       }
       down = toImg(e);
@@ -384,6 +409,7 @@ export function createWorkspace(app) {
       if (painting) {
         painting = false;
         last = null;
+        if (S.brush.smart) Seg.fillHoles(S.labels, S.w, S.h, S.selected);
         S.manual = true;
         recompute({ keep: S.selected });
         markDirty();
@@ -421,6 +447,7 @@ export function createWorkspace(app) {
     if (m === 'color' && !S.groups.length) { toast('目前沒有任何一種線，請先新增'); return; }
     S.mode = m;
     S.brush.on = false;
+    S.wand = false;
     if (m === 'color') S.selected = null;
     brushCursor.hidden = true;
     refresh();
@@ -429,7 +456,7 @@ export function createWorkspace(app) {
   function groupChip(g, { onClick, selected }) {
     return h('button', { type: 'button', class: `gchip ${selected ? 'on' : ''}`, 'aria-pressed': String(!!selected), onclick: onClick },
       h('span', { class: 'gnum' }, g.n),
-      h('span', { class: 'gdot', style: { background: S.showRegions || S.brush.on ? regionColor(g) : srcHex(g) } })
+      h('span', { class: 'gdot', style: { background: S.showRegions || S.brush.on || S.wand ? regionColor(g) : srcHex(g) } })
     );
   }
 
@@ -462,6 +489,11 @@ export function createWorkspace(app) {
 
     const brushSize = h('input', { type: 'range', min: 1, max: 100, value: S.brush.size, id: 'brush-size', 'aria-label': '筆刷大小' });
     brushSize.addEventListener('input', () => (S.brush.size = Number(brushSize.value)));
+    const tol = h('input', { type: 'range', min: 4, max: 60, value: S.tol, id: 'tool-tol', 'aria-label': '顏色容許範圍' });
+    tol.addEventListener('input', () => (S.tol = Number(tol.value)));
+    const smart = h('input', { type: 'checkbox', id: 'brush-smart', checked: S.brush.smart });
+    smart.addEventListener('change', () => { S.brush.smart = smart.checked; renderPanel(); });
+    const target = selGroup ? `${selGroup.n} 號線` : sel === BG ? '背景' : '未選';
 
     return h('div', { class: 'panel-body' },
       h('p', { class: 'lead' }, `找到 ${S.groups.length} 種線，圖上的數字是每種線的位置。辨識不對的話，在這裡修正。`),
@@ -479,17 +511,33 @@ export function createWorkspace(app) {
         button('刪除這種線', { icon: 'trash', onClick: deleteSelected, disabled: !selGroup, title: '改成背景，不換色' }),
         button('新增一種線', { icon: 'plus', onClick: addGroup }),
         button(S.brush.on ? '關閉筆刷' : '筆刷塗改', { icon: 'brush', kind: S.brush.on ? 'on' : '', onClick: toggleBrush }),
+        button(S.wand ? '關閉魔術棒' : '魔術棒', { icon: 'wand', kind: S.wand ? 'on' : '', onClick: toggleWand, title: '點一下，把相連、顏色相近的整片改成選好的線' }),
         button('復原', { icon: 'undo', onClick: undo, disabled: !S.undo.length })
       ),
-      S.brush.on
-        ? h('label', { class: 'field' }, h('span', {}, `筆刷大小（正在塗：${selGroup ? selGroup.n + ' 號線' : sel === BG ? '背景' : '未選'}）`), brushSize)
+      S.brush.on || S.wand
+        ? h('div', { class: 'tool-box' },
+          h('p', { class: 'small' }, S.brush.on ? `在圖上塗，塗到的地方會變成：${target}` : `點圖上的一個地方，相連又相近的顏色會變成：${target}`),
+          S.brush.on ? h('label', { class: 'field' }, h('span', {}, '筆刷大小'), brushSize) : null,
+          S.brush.on ? h('label', { class: 'check' }, smart, h('span', {}, '只塗跟下筆處相近的顏色（智慧筆刷）')) : null,
+          S.wand || S.brush.smart
+            ? h('label', { class: 'field' }, h('span', {}, '顏色容許範圍'), tol, h('span', { class: 'range-labels' }, h('span', {}, '只選很像的'), h('span', {}, '範圍大一點')))
+            : null
+        )
         : null,
       button('辨識完成，開始配色', { kind: 'primary block', onClick: () => setMode('color') })
     );
   }
 
+  function toggleWand() {
+    S.wand = !S.wand;
+    if (S.wand) S.brush.on = false;
+    if (S.wand && S.selected === null) toast('先選要改成哪一種線，再點圖');
+    refresh();
+  }
+
   function toggleBrush() {
     S.brush.on = !S.brush.on;
+    if (S.brush.on) S.wand = false;
     if (S.brush.on && S.selected === null) toast('先選要塗的線，再在圖上塗');
     refresh();
   }

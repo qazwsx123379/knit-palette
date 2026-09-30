@@ -267,6 +267,92 @@ export function paintCircle(labels, w, h, cx, cy, r, value) {
   }
 }
 
+// 顏色距離。亮度也要算：白色線和淺灰背景主要就差在亮度
+function toolDist(lab, i, seed) {
+  const dL = (lab[i * 3] - seed[0]) * 0.9;
+  const da = lab[i * 3 + 1] - seed[1];
+  const db = lab[i * 3 + 2] - seed[2];
+  return Math.sqrt(dL * dL + da * da + db * db);
+}
+
+// 取某一點附近的平均顏色（當作智慧筆刷、魔術棒的基準色）
+export function sampleLab(prep, x, y, r = 2) {
+  const { w, h, lab } = prep;
+  let L = 0, a = 0, b = 0, c = 0;
+  for (let yy = Math.max(0, y - r); yy <= Math.min(h - 1, y + r); yy++) {
+    for (let xx = Math.max(0, x - r); xx <= Math.min(w - 1, x + r); xx++) {
+      const i = yy * w + xx;
+      L += lab[i * 3]; a += lab[i * 3 + 1]; b += lab[i * 3 + 2]; c++;
+    }
+  }
+  return [L / c, a / c, b / c];
+}
+
+// 智慧筆刷：圓形範圍內，只塗跟基準色相近的像素
+export function paintCircleSmart(labels, prep, cx, cy, r, value, seed, tol) {
+  const { w, h, lab } = prep;
+  const r2 = r * r;
+  const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(w - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(h - 1, Math.ceil(cy + r));
+  for (let y = y0; y <= y1; y++) {
+    const dy = y - cy;
+    for (let x = x0; x <= x1; x++) {
+      const dx = x - cx;
+      if (dx * dx + dy * dy > r2) continue;
+      const i = y * w + x;
+      if (toolDist(lab, i, seed) <= tol) labels[i] = value;
+    }
+  }
+}
+
+// 魔術棒：從點下去的地方開始，把相連、顏色相近的整片改成指定的線
+export function floodSelect(labels, prep, sx, sy, value, tol) {
+  const { w, h, lab } = prep;
+  const seed = sampleLab(prep, sx, sy);
+  const seen = new Uint8Array(w * h);
+  const stack = [sy * w + sx];
+  seen[stack[0]] = 1;
+  let count = 0;
+  while (stack.length) {
+    const i = stack.pop();
+    if (toolDist(lab, i, seed) > tol) continue;
+    labels[i] = value;
+    count++;
+    const x = i % w;
+    if (x > 0 && !seen[i - 1]) { seen[i - 1] = 1; stack.push(i - 1); }
+    if (x < w - 1 && !seen[i + 1]) { seen[i + 1] = 1; stack.push(i + 1); }
+    if (i >= w && !seen[i - w]) { seen[i - w] = 1; stack.push(i - w); }
+    if (i < w * (h - 1) && !seen[i + w]) { seen[i + w] = 1; stack.push(i + w); }
+  }
+  fillHoles(labels, w, h, value);
+  return count;
+}
+
+// 補洞：周圍大多是指定的線、自己卻不是的零星像素，也改成指定的線（陰影、雜點造成的小洞）
+export function fillHoles(labels, w, h, value, passes = 3) {
+  for (let p = 0; p < passes; p++) {
+    const flip = [];
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const i = y * w + x;
+        if (labels[i] === value) continue;
+        let c = 0;
+        if (labels[i - 1] === value) c++;
+        if (labels[i + 1] === value) c++;
+        if (labels[i - w] === value) c++;
+        if (labels[i + w] === value) c++;
+        if (labels[i - w - 1] === value) c++;
+        if (labels[i - w + 1] === value) c++;
+        if (labels[i + w - 1] === value) c++;
+        if (labels[i + w + 1] === value) c++;
+        if (c >= 5) flip.push(i);
+      }
+    }
+    if (!flip.length) break;
+    for (const i of flip) labels[i] = value;
+  }
+}
+
 // 找出每種線要標數字的位置：每個大區塊裡「離邊界最遠」的點
 export function labelPositions(labels, w, h, ids) {
   const scale = Math.min(1, 180 / Math.max(w, h));

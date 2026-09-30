@@ -122,7 +122,25 @@ export function detectSwatches(imageData) {
     w: Math.round((c.x1 - c.x0 + 1) / scale),
     h: Math.round((c.y1 - c.y0 + 1) / scale),
   }));
-  return sortReadingOrder(boxes);
+  return sortReadingOrder(snapToGrid(boxes));
+}
+
+// 整齊排列的色卡：某個色塊的框明顯比別人小（例如白色線在白底上只找到一半），
+// 就對齊同一欄、同一列的其他色塊，補成一樣大
+function snapToGrid(boxes) {
+  if (boxes.length < 4) return boxes;
+  const medW = median(boxes.map((b) => b.w));
+  const medH = median(boxes.map((b) => b.h));
+  const normal = boxes.filter((b) => Math.abs(b.w - medW) < medW * 0.12 && Math.abs(b.h - medH) < medH * 0.12);
+  if (normal.length < boxes.length * 0.5) return boxes;
+  return boxes.map((b) => {
+    if (normal.includes(b)) return b;
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    const col = normal.filter((n) => Math.abs(n.x - b.x) < medW * 0.3 || Math.abs(n.x + n.w - (b.x + b.w)) < medW * 0.3 || Math.abs(n.x + n.w / 2 - cx) < medW * 0.3);
+    const row = normal.filter((n) => Math.abs(n.y + n.h / 2 - cy) < medH * 0.5 || Math.abs(n.y - b.y) < medH * 0.3);
+    if (!col.length || !row.length) return b;
+    return { x: Math.round(median(col.map((n) => n.x))), y: Math.round(median(row.map((n) => n.y))), w: Math.round(medW), h: Math.round(medH) };
+  });
 }
 
 function erode(mask, w, h, r) {
@@ -264,54 +282,244 @@ export function cropThumb(source, box, size = 96) {
   return c.toDataURL('image/jpeg', 0.82);
 }
 
-const CJK = /[　-鿿＀-￯]/;
+const CJK = /[　-鿿豈-﫿]/;
+const CJK_G = /[　-鿿豈-﫿]/g;
 
-function joinWords(words) {
-  let s = '';
-  for (const wd of words) {
-    const t = wd.text.trim();
-    if (!t) continue;
-    if (s && !(CJK.test(s[s.length - 1]) && CJK.test(t[0]))) s += ' ';
-    s += t;
+// 找出色塊的文字標籤（色號、色名）。只留下「白色標籤底上的深色字」，
+// 毛線的紋理、顏色、深色毛線本身都不會被當成字。
+// 回傳 { parts: [{ canvas, role: 'code' | 'name' | 'all' }] }，色號和色名分開，辨識比較準
+export function textCrop(imageData, box, boxes = []) {
+  const { width: W, height: H, data } = imageData;
+  // 只在色塊的左右範圍內找（稍微內縮，避開邊框和隔壁色塊）
+  const x0 = Math.max(0, Math.round(box.x + box.w * 0.03));
+  const x1 = Math.min(W, Math.round(box.x + box.w * 0.97));
+  const y0 = Math.max(0, Math.round(box.y));
+  // 往下找到下一個色塊為止，最多 0.8 倍色塊高
+  let y1 = Math.min(H, Math.round(box.y + box.h * 1.8));
+  for (const b of boxes) {
+    if (b === box || b.y <= box.y + box.h * 0.5) continue;
+    const overlapX = Math.min(b.x + b.w, box.x + box.w) - Math.max(b.x, box.x);
+    if (overlapX > box.w * 0.3) y1 = Math.min(y1, Math.max(box.y + box.h, b.y));
   }
-  return s.trim();
+  const w = x1 - x0, h = y1 - y0;
+  if (w < 4 || h < 4) return null;
+  const dark = new Uint8Array(w * h);
+  const paper = new Uint8Array(w * h);
+  const light = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = ((y0 + y) * W + x0 + x) * 4;
+      const [L, a, b] = rgbToLab(data[o], data[o + 1], data[o + 2]);
+      const C = Math.hypot(a, b);
+      const i = y * w + x;
+      light[i] = C < 28 ? L : 100;
+      dark[i] = L < 55 && C < 26 ? 1 : 0;
+      paper[i] = L > 80 && C < 18 ? 1 : 0;
+    }
+  }
+  // 字的旁邊要有白色標籤底（上下左右一小段距離內）
+  const reach = Math.max(3, Math.round(box.h * 0.035));
+  const nearPaper = boxBlurAny(paper, w, h, reach);
+  const mask = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) mask[i] = dark[i] && nearPaper[i] ? 1 : 0;
+
+  // 每一列有幾個文字像素，找出文字所在的橫條
+  const rows = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    let c = 0;
+    for (let x = 0; x < w; x++) c += mask[y * w + x];
+    rows[y] = c;
+  }
+  // 一列要有夠多文字像素才算有字（邊框、零星雜點不算）
+  const th = Math.max(3, w * 0.04);
+  const bands = [];
+  let start = -1, gap = 0;
+  for (let y = 0; y <= h; y++) {
+    const on = y < h && rows[y] >= th;
+    if (on) {
+      if (start < 0) start = y;
+      gap = 0;
+    } else if (start >= 0) {
+      gap++;
+      if (gap > 2 || y === h) {
+        const end = y - gap + 1;
+        let score = 0;
+        for (let k = start; k < end; k++) score += rows[k];
+        if (end - start >= Math.max(4, box.h * 0.05) && end - start <= box.h * 0.5) bands.push({ start, end, score });
+        start = -1;
+        gap = 0;
+      }
+    }
+  }
+  if (!bands.length) return null;
+  const best = bands.reduce((m, b) => (b.score > m.score ? b : m));
+  const bh = best.end - best.start;
+  // 兩行字（色號一行、色名一行）時一起拿
+  const chosen = bands
+    .filter((b) => b === best || (b.score >= best.score * 0.3 && Math.abs(b.start - best.start) < bh * 2.6))
+    .sort((a, b) => a.start - b.start);
+
+  const colsOf = (ys, ye) => {
+    const cols = new Float32Array(w);
+    for (let x = 0; x < w; x++) {
+      let c = 0;
+      for (let y = ys; y < ye; y++) c += mask[y * w + x];
+      cols[x] = c;
+    }
+    return cols;
+  };
+  const extent = (cols) => {
+    let a = -1, b = -1;
+    for (let x = 0; x < w; x++) if (cols[x] > 0) { if (a < 0) a = x; b = x; }
+    return [a, b];
+  };
+  const render = (cx0, cx1, ys, ye) => renderText(light, w, h, cx0, cx1, ys, ye, ye - ys);
+
+  const parts = [];
+  if (chosen.length >= 2) {
+    // 兩行：第一行當色號，其餘當色名
+    const [a0, a1] = extent(colsOf(chosen[0].start, chosen[0].end));
+    const rest = chosen.slice(1);
+    const rs = rest[0].start, re = rest[rest.length - 1].end;
+    const [b0, b1] = extent(colsOf(rs, re));
+    if (a0 >= 0) parts.push({ role: 'code', canvas: render(a0, a1, chosen[0].start, chosen[0].end) });
+    if (b0 >= 0) parts.push({ role: 'name', canvas: render(b0, b1, rs, re) });
+    return parts.length ? { parts } : null;
+  }
+  // 一行：用最寬的空隙把色號和色名切開（空隙要在前半段）
+  const cols = colsOf(best.start, best.end);
+  const [c0, c1] = extent(cols);
+  if (c0 < 0) return null;
+  let gapBest = null, run = 0;
+  for (let x = c0; x <= c1; x++) {
+    if (cols[x] === 0) run++;
+    else {
+      if (run > 0) {
+        const gs = x - run;
+        // 色號至少要有兩個數字寬，避免把「15」切成「1」和「5」
+        if (gs < c0 + (c1 - c0) * 0.55 && gs - c0 >= bh * 0.8 && (!gapBest || run > gapBest.len)) gapBest = { start: gs, len: run };
+      }
+      run = 0;
+    }
+  }
+  if (gapBest && gapBest.len >= bh * 0.22) {
+    parts.push({ role: 'code', canvas: render(c0, gapBest.start - 1, best.start, best.end) });
+    parts.push({ role: 'name', canvas: render(gapBest.start + gapBest.len, c1, best.start, best.end) });
+  } else {
+    parts.push({ role: 'all', canvas: render(c0, c1, best.start, best.end) });
+  }
+  return { parts };
 }
 
-// 把 OCR 讀到的字配給最近的色塊（優先找色塊正下方，其次右邊、色塊上面的字）
-export function assignText(boxes, words) {
-  const result = boxes.map(() => []);
-  for (const wd of words) {
-    const t = (wd.text || '').trim();
-    if (!t || wd.confidence < 25) continue;
-    const { x0, y0, x1, y1 } = wd.bbox;
-    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-    let best = -1, bestScore = Infinity;
-    boxes.forEach((b, i) => {
-      let score = Infinity;
-      const inX = cx >= b.x - b.w * 0.25 && cx <= b.x + b.w * 1.25;
-      const inY = cy >= b.y && cy <= b.y + b.h;
-      if (inX && cy > b.y + b.h * 0.5 && cy - (b.y + b.h) < b.h * 1.6) {
-        score = Math.max(0, cy - (b.y + b.h)); // 正下方
-      } else if (inY && x0 >= b.x + b.w * 0.6 && x0 - (b.x + b.w) < b.w * 1.6) {
-        score = 1000 + Math.max(0, x0 - (b.x + b.w)); // 右邊
-      } else if (inY && cx >= b.x && cx <= b.x + b.w) {
-        score = 500; // 字壓在色塊上
-      }
-      if (score < bestScore) { bestScore = score; best = i; }
-    });
-    if (best >= 0) result[best].push(wd);
+// 附近 r 像素內有沒有 1（方形範圍）
+function boxBlurAny(mask, w, h, r) {
+  const tmp = new Uint8Array(w * h);
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    let last = -1e9;
+    const row = y * w;
+    const near = new Float32Array(w).fill(1e9);
+    for (let x = 0; x < w; x++) { if (mask[row + x]) last = x; near[x] = x - last; }
+    last = 1e9;
+    for (let x = w - 1; x >= 0; x--) { if (mask[row + x]) last = x; near[x] = Math.min(near[x], last - x); }
+    for (let x = 0; x < w; x++) tmp[row + x] = near[x] <= r ? 1 : 0;
   }
-  return result.map((ws) => {
-    // 依行排序
-    ws.sort((a, b) => (Math.abs(a.bbox.y0 - b.bbox.y0) < 8 ? a.bbox.x0 - b.bbox.x0 : a.bbox.y0 - b.bbox.y0));
-    const tokens = ws.map((w) => ({ ...w, text: w.text.trim() }));
-    const codeIdx = tokens.findIndex((t) => /\d/.test(t.text));
-    let code = '';
-    let rest = tokens;
-    if (codeIdx >= 0) {
-      code = tokens[codeIdx].text.replace(/^[^\w#]+|[^\w]+$/g, '');
-      rest = tokens.filter((_, i) => i !== codeIdx);
+  for (let x = 0; x < w; x++) {
+    let last = -1e9;
+    const near = new Float32Array(h).fill(1e9);
+    for (let y = 0; y < h; y++) { if (tmp[y * w + x]) last = y; near[y] = y - last; }
+    last = 1e9;
+    for (let y = h - 1; y >= 0; y--) { if (tmp[y * w + x]) last = y; near[y] = Math.min(near[y], last - y); }
+    for (let y = 0; y < h; y++) out[y * w + x] = near[y] <= r ? 1 : 0;
+  }
+  return out;
+}
+
+// 把一段文字畫成白底黑字、字高約 60 像素的圖
+function renderText(light, w, h, cx0, cx1, ys, ye, bh) {
+  const pad = Math.round(bh * 0.35);
+  const sx = Math.max(0, cx0 - pad), sy = Math.max(0, ys - pad);
+  const ex = Math.min(w, cx1 + pad + 1), ey = Math.min(h, ye + pad);
+  const cw = ex - sx, ch = ey - sy;
+  const small = document.createElement('canvas');
+  small.width = cw;
+  small.height = ch;
+  const sctx = small.getContext('2d');
+  const img = sctx.createImageData(cw, ch);
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      const L = light[(sy + y) * w + sx + x];
+      const v = Math.max(0, Math.min(255, ((L - 30) / 40) * 255));
+      const o = (y * cw + x) * 4;
+      img.data[o] = img.data[o + 1] = img.data[o + 2] = v;
+      img.data[o + 3] = 255;
     }
-    return { code, name: joinWords(rest) };
+  }
+  sctx.putImageData(img, 0, 0);
+  const scale = Math.max(1, Math.min(5, 64 / Math.max(1, bh)));
+  const out = document.createElement('canvas');
+  out.width = Math.round(cw * scale) + 48;
+  out.height = Math.round(ch * scale) + 48;
+  const octx = out.getContext('2d');
+  octx.fillStyle = '#fff';
+  octx.fillRect(0, 0, out.width, out.height);
+  octx.imageSmoothingQuality = 'high';
+  octx.drawImage(small, 24, 24, cw * scale, ch * scale);
+  return out;
+}
+
+// 把 OCR 讀到的一段字拆成色號和色名，例如「01冰雪白」→ 01、冰雪白
+export function parseLabel(text) {
+  let t = (text || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s#\-.'&]/gu, ' ')
+    .replace(/([A-Za-z0-9])(?=[　-鿿])/g, '$1 ')
+    .replace(/([　-鿿])(?=[A-Za-z0-9])/g, '$1 ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const tokens = t.split(' ').filter(Boolean);
+  // 色號：第一個含數字的詞；O 看成 0、I/l 看成 1
+  const norm = (tok) => (/^[0-9OoIl]+$/.test(tok) && /\d/.test(tok) ? tok.replace(/[Oo]/g, '0').replace(/[Il]/g, '1') : tok);
+  let idx = tokens.findIndex((tok) => /\d/.test(tok) || /^[Oo][0-9]/.test(tok));
+  let code = '';
+  if (idx >= 0) {
+    code = norm(tokens[idx]).replace(/^[.\-']+|[.\-']+$/g, '');
+    tokens.splice(idx, 1);
+  }
+  let nameTokens = tokens;
+  // 名字有中文時，旁邊零星的一兩個英文字母通常是雜訊
+  if (nameTokens.some((tok) => CJK.test(tok))) nameTokens = nameTokens.filter((tok) => CJK.test(tok) || tok.length > 2);
+  let name = '';
+  for (const tok of nameTokens) {
+    if (name && !(CJK.test(name[name.length - 1]) && CJK.test(tok[0]))) name += ' ';
+    name += tok;
+  }
+  // 中文字之間不要有空白
+  name = name.replace(/([　-鿿])\s+(?=[　-鿿])/g, '$1');
+  return { code, name: name.trim(), cjk: (name.match(CJK_G) || []).length };
+}
+
+// 色號是連續編號時（01、02、03…），用前後的號碼補正讀錯或讀不到的色號
+// rows 要照色卡上的順序排列；會直接修改 rows[i].code
+export function fixSequence(rows) {
+  const nums = rows.map((r, i) => (/^\d+$/.test(r.code) ? { i, v: Number(r.code), len: r.code.length } : null));
+  const counts = new Map();
+  for (const n of nums) if (n) counts.set(n.v - n.i, (counts.get(n.v - n.i) || 0) + 1);
+  let offset = null, best = 0;
+  for (const [k, c] of counts) if (c > best) { best = c; offset = k; }
+  if (offset === null || best < Math.max(3, rows.length * 0.5)) return 0;
+  const lens = new Map();
+  for (const n of nums) if (n && n.v - n.i === offset) lens.set(n.len, (lens.get(n.len) || 0) + 1);
+  const width = [...lens.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  let fixed = 0;
+  rows.forEach((r, i) => {
+    const expect = String(i + offset).padStart(width, '0');
+    if (r.code === expect) return;
+    const n = nums[i];
+    // 讀到的是正常數字、長度也對，但跟順序不合：可能色卡本來就跳號，保留
+    if (n && n.len === width) return;
+    r.code = expect;
+    fixed++;
   });
+  return fixed;
 }

@@ -1,7 +1,7 @@
 // 新增品牌與色號：上傳色卡截圖 → 自動找色塊、取色、讀文字 → 確認清單 → 加入線材庫
 import { h, icon, button, toast, loading, pickFiles, fileToImage, nextFrame, confirmDialog } from './ui.js';
-import { detectSwatches, swatchColor, pickColor, cropThumb, assignText } from './swatches.js';
-import { readWords, OCR_LANGS } from './ocr.js';
+import { detectSwatches, swatchColor, pickColor, cropThumb, textCrop, parseLabel, fixSequence } from './swatches.js';
+import { prepareOcr, readLabelParts, OCR_LANGS } from './ocr.js';
 
 function loadPref(key, fallback) {
   try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
@@ -20,7 +20,7 @@ export function createImportView(app) {
       brandId: params.brandId || null,
       newBrand: '',
       lang: loadPref('ocr-lang', 'eng'),
-      shots: [], // { img, imageData, words }
+      shots: [], // { img, imageData, boxes }
       rows: [],
       active: 0,
       tool: null, // 'frame' | { eyedrop: row }
@@ -87,6 +87,14 @@ export function createImportView(app) {
     return b ? b.name : state.newBrand.trim();
   }
 
+  async function readLabel(imageData, box, boxes) {
+    const crop = textCrop(imageData, box, boxes);
+    if (!crop) return { code: '', name: '' };
+    const { code, text } = await readLabelParts(crop.parts, state.lang);
+    const parsed = parseLabel(code ? `${code} ${text}` : text);
+    return { code: parsed.code, name: parsed.name };
+  }
+
   // ---------- 第二步：分析 ----------
   async function process(files) {
     if (!state.brandId && !state.newBrand.trim()) {
@@ -108,21 +116,24 @@ export function createImportView(app) {
         c.getContext('2d').drawImage(img, 0, 0);
         const imageData = c.getContext('2d').getImageData(0, 0, c.width, c.height);
         const boxes = detectSwatches(imageData);
-        let words = [];
+        const texts = boxes.map(() => ({ code: '', name: '' }));
         if (!ocrFailed) {
-          busy.set(`${tag}讀色號和色名…`);
           try {
-            words = await readWords(c, state.lang, (m) => {
-              if (m.status === 'recognizing text') busy.set(`${tag}讀色號和色名… ${Math.round(m.progress * 100)}%`);
-              else if (/load|download|initializ/i.test(m.status)) busy.set(`${tag}下載文字辨識資料…`);
+            busy.set(`${tag}準備文字辨識…`);
+            await prepareOcr(state.lang, (m) => {
+              if (/load|download|initializ/i.test(m.status)) busy.set(`${tag}下載文字辨識資料…`);
             });
+            for (let i = 0; i < boxes.length; i++) {
+              busy.set(`${tag}讀色號和色名 ${i + 1}/${boxes.length}…`);
+              texts[i] = await readLabel(imageData, boxes[i], boxes);
+            }
+            fixSequence(texts);
           } catch (e) {
             ocrFailed = e;
           }
         }
-        const texts = assignText(boxes, words);
         const shotIndex = state.shots.length;
-        state.shots.push({ img, imageData, words });
+        state.shots.push({ img, imageData, boxes });
         boxes.forEach((box, i) => {
           state.rows.push({
             shot: shotIndex, box,
@@ -267,9 +278,17 @@ export function createImportView(app) {
       rectEl && rectEl.remove();
       rectEl = null;
       if (box.w < 6 || box.h < 6) return;
-      const text = assignText([box], shot.words)[0];
-      state.rows.push({ shot: state.active, box, code: text.code, name: text.name, hex: swatchColor(shot.imageData, box), thumb: cropThumb(shot.img, box), fav: false, owned: false });
+      const row = { shot: state.active, box, code: '', name: '', hex: swatchColor(shot.imageData, box), thumb: cropThumb(shot.img, box), fav: false, owned: false };
+      state.rows.push(row);
       drawRows();
+      // 框出來的色塊也試著讀字，讀到了再填進去
+      readLabel(shot.imageData, box, shot.boxes).then((t) => {
+        if (!row.code && !row.name && (t.code || t.name)) {
+          row.code = t.code;
+          row.name = t.name;
+          drawRows();
+        }
+      }).catch(() => {});
       rowsEl.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       toast(`已加入第 ${state.rows.length} 個`);
     });

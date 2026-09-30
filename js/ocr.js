@@ -29,40 +29,54 @@ function loadLib() {
 
 const workers = new Map();
 
-async function getWorker(langs, onProgress) {
+// mode：'code' 只讀數字和英文字母（色號）；'line' 讀一行字；'block' 讀一小塊字
+async function getWorker(langs, mode, onProgress) {
   await loadLib();
-  if (!workers.has(langs)) {
+  const key = `${langs}|${mode}`;
+  if (!workers.has(key)) {
     workers.set(
-      langs,
+      key,
       window.Tesseract.createWorker(langs, 1, {
         logger: (m) => onProgress && onProgress(m),
+      }).then(async (w) => {
+        const params = { tessedit_pageseg_mode: mode === 'block' ? '6' : '7', preserve_interword_spaces: '1' };
+        if (mode === 'code') params.tessedit_char_whitelist = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-#.';
+        await w.setParameters(params);
+        return w;
       })
     );
   }
-  return workers.get(langs);
+  return workers.get(key);
 }
 
-// 回傳每個字的文字、信心分數和位置（原圖座標）
-export async function readWords(source, langs = 'eng', onProgress) {
-  const worker = await getWorker(langs, onProgress);
-  // 小圖放大兩倍，字比較容易讀對
-  const w = source.width, h = source.height;
-  const scale = Math.max(w, h) < 1600 ? 2 : 1;
-  const c = document.createElement('canvas');
-  c.width = w * scale;
-  c.height = h * scale;
-  const ctx = c.getContext('2d');
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(source, 0, 0, c.width, c.height);
-  const { data } = await worker.recognize(c);
-  return (data.words || []).map((wd) => ({
-    text: wd.text,
-    confidence: wd.confidence,
-    bbox: {
-      x0: wd.bbox.x0 / scale,
-      y0: wd.bbox.y0 / scale,
-      x1: wd.bbox.x1 / scale,
-      y1: wd.bbox.y1 / scale,
-    },
-  }));
+// 色名用哪種語言：選「中文加英文」時色名只用中文，比較不會把中文讀成英文字母
+export function nameLang(langs) {
+  if (langs === 'eng+chi_tra') return 'chi_tra';
+  if (langs === 'eng+jpn') return 'jpn';
+  return langs;
+}
+
+// 先下載好辨識工具（顯示「下載中」用）
+export async function prepareOcr(langs, onProgress) {
+  await getWorker('eng', 'code', onProgress);
+  await getWorker(nameLang(langs), 'line', onProgress);
+  await getWorker(langs, 'block', onProgress);
+}
+
+// 讀 textCrop 切好的文字小圖，回傳 { code, text }
+export async function readLabelParts(parts, langs = 'eng') {
+  let code = '', text = '';
+  for (const p of parts) {
+    if (p.role === 'code') {
+      const w = await getWorker('eng', 'code');
+      code = ((await w.recognize(p.canvas)).data.text || '').replace(/\s+/g, '');
+    } else if (p.role === 'name') {
+      const w = await getWorker(nameLang(langs), 'line');
+      text += ' ' + ((await w.recognize(p.canvas)).data.text || '');
+    } else {
+      const w = await getWorker(langs, 'block');
+      text += ' ' + ((await w.recognize(p.canvas)).data.text || '');
+    }
+  }
+  return { code, text };
 }
