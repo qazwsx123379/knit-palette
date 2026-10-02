@@ -6,7 +6,7 @@ import { createWorkspace } from './workspace.js';
 import { createLibraryView } from './library.js';
 import { createImportView } from './importer.js';
 import { createGalleryView } from './gallery.js';
-import { createSettingsView, readSettings } from './settings.js';
+import { createSettingsView, readSettings, APP_VERSION } from './settings.js';
 import { seedDemo } from './demo.js';
 
 const root = document.getElementById('app');
@@ -45,7 +45,7 @@ function shell() {
   main = h('main', { class: 'main' });
   root.replaceChildren(
     h('header', { class: 'topbar' },
-      h('a', { class: 'brand', href: '#work' }, icon('yarn'), h('span', {}, '編織配色')),
+      h('a', { class: 'brand', href: '#work', title: `版本：${APP_VERSION}` }, icon('yarn'), h('span', {}, '編織配色')),
       nav,
       statusEl,
       h('a', { class: 'icon-btn', href: '#settings', title: '設定', 'aria-label': '設定', 'data-route': 'settings' }, icon('gear'))

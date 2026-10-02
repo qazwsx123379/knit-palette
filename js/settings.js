@@ -2,6 +2,9 @@
 import { h, button, toast, confirmDialog } from './ui.js';
 import { GitHubStore } from './github.js';
 
+// 每次發布新版都要改，方便確認手機、電腦上用的是不是最新版
+export const APP_VERSION = '2026-10-03 第 14 版';
+
 const KEY = 'knit-github';
 
 export function readSettings() {
@@ -85,7 +88,8 @@ export function createSettingsView(app) {
           h('li', {}, '按「Generate token」，複製 github_pat_ 開頭的金鑰，貼到上面的欄位。')
         ),
         h('p', { class: 'muted' }, '金鑰只存在這台裝置的瀏覽器裡，不會傳到其他地方。這把金鑰只能動這一個 repo，就算外流也碰不到你的其他資料。')
-      )
+      ),
+      h('p', { class: 'muted small', id: 'app-version' }, `App 版本：${APP_VERSION}。如果跟最新版不同，請關掉分頁重新打開，或按住重新整理鍵強制更新。`)
     );
   }
 
