@@ -353,6 +353,117 @@ export function fillHoles(labels, w, h, value, passes = 3) {
   }
 }
 
+// 自動分開背景：同一種顏色裡，「平滑又大片」的是背景（桌面、地板），「有針目紋理」的是毛線
+// 白色作品放在淺色桌面上時，兩者顏色一樣，只能靠紋理分開
+// 回傳變成背景的像素數
+const TEX_SMOOTH = 0.22; // 細紋理平均起伏小於這個值算平滑（項圈照片量過：背景、陰影 0.0–0.2，毛線 0.3 以上）
+
+export function separateBackground(prep, labels, id) {
+  const { w, h, n, lab } = prep;
+  const r = Math.max(3, Math.round(Math.max(w, h) * 0.006));
+  // 每個像素附近的亮度起伏（紋理強弱）
+  const L = new Float32Array(n);
+  for (let i = 0; i < n; i++) L[i] = lab[i * 3];
+  const blur = (src) => blurR(src, r);
+  // 方框模糊（半徑 rr）
+  function blurR(src, rr) {
+    const r = rr;
+    const tmp = new Float32Array(n), out = new Float32Array(n), k = 2 * r + 1;
+    for (let y = 0; y < h; y++) {
+      let a = 0;
+      for (let x = -r; x <= r; x++) a += src[y * w + Math.min(w - 1, Math.max(0, x))];
+      for (let x = 0; x < w; x++) { tmp[y * w + x] = a / k; a += src[y * w + Math.min(w - 1, x + r + 1)] - src[y * w + Math.max(0, x - r)]; }
+    }
+    for (let x = 0; x < w; x++) {
+      let a = 0;
+      for (let y = -r; y <= r; y++) a += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
+      for (let y = 0; y < h; y++) { out[y * w + x] = a / k; a += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x]; }
+    }
+    return out;
+  }
+  // 只看細小的起伏（針目），陰影這種慢慢變暗的漸層不算紋理
+  const fine = blurR(L, 2);
+  const hp = new Float32Array(n);
+  for (let i = 0; i < n; i++) hp[i] = Math.abs(L[i] - fine[i]);
+  const tex = blur(hp);
+  const smooth = new Uint8Array(n);
+  for (let i = 0; i < n; i++) if (labels[i] === id && tex[i] < TEX_SMOOTH) smooth[i] = 1;
+  // 平滑的連成一大片（超過整張圖 0.05%）才算背景；毛線上零星的平滑小點不算
+  const minArea = n * 0.0005;
+  const comp = new Int32Array(n).fill(-1);
+  const bg = new Uint8Array(n);
+  const stack = [];
+  for (let s0 = 0; s0 < n; s0++) {
+    if (!smooth[s0] || comp[s0] >= 0) continue;
+    const members = [];
+    comp[s0] = s0;
+    stack.push(s0);
+    while (stack.length) {
+      const i = stack.pop();
+      members.push(i);
+      const x = i % w;
+      for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+        if (j < 0 || j >= n || !smooth[j] || comp[j] >= 0) continue;
+        comp[j] = s0;
+        stack.push(j);
+      }
+    }
+    if (members.length >= minArea) for (const i of members) bg[i] = 1;
+  }
+  // 背景和毛線的平均顏色
+  const sumB = [0, 0, 0], sumY = [0, 0, 0];
+  let nb = 0, ny = 0;
+  for (let i = 0; i < n; i++) {
+    if (labels[i] !== id) continue;
+    const t = bg[i] ? sumB : sumY;
+    t[0] += lab[i * 3]; t[1] += lab[i * 3 + 1]; t[2] += lab[i * 3 + 2];
+    if (bg[i]) nb++; else ny++;
+  }
+  if (!nb) return 0;
+  const cb = sumB.map((v) => v / nb), cy = ny ? sumY.map((v) => v / ny) : cb;
+  // 交界附近（紋理計算會往外暈開一點）：顏色比較像背景的，也算背景
+  const near = new Uint8Array(n);
+  for (let i = 0; i < n; i++) if (bg[i]) near[i] = 1;
+  for (let pass = 0; pass < r + 2; pass++) {
+    const grow = [];
+    for (let i = 0; i < n; i++) {
+      if (near[i] || labels[i] !== id) continue;
+      const x = i % w;
+      if ((x > 0 && near[i - 1]) || (x < w - 1 && near[i + 1]) || (i >= w && near[i - w]) || (i + w < n && near[i + w])) grow.push(i);
+    }
+    for (const i of grow) {
+      near[i] = 2;
+      const d = (c) => (lab[i * 3] - c[0]) ** 2 + (lab[i * 3 + 1] - c[1]) ** 2 + (lab[i * 3 + 2] - c[2]) ** 2;
+      if (d(cb) <= d(cy)) bg[i] = 1;
+    }
+  }
+  // 剩下的「毛線」裡，靠近圖片邊緣又很小塊的（浮水印、雜點）也算背景；作品中間的小點（裝飾針）保留
+  const edge = Math.round(Math.min(w, h) * 0.04);
+  const seen = new Uint8Array(n);
+  for (let s0 = 0; s0 < n; s0++) {
+    if (seen[s0] || bg[s0] || labels[s0] !== id) continue;
+    const members = [];
+    let nearEdge = false;
+    seen[s0] = 1;
+    stack.push(s0);
+    while (stack.length) {
+      const i = stack.pop();
+      members.push(i);
+      const x = i % w, y = (i / w) | 0;
+      if (x < edge || y < edge || x >= w - edge || y >= h - edge) nearEdge = true;
+      for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+        if (j < 0 || j >= n || seen[j] || bg[j] || labels[j] !== id) continue;
+        seen[j] = 1;
+        stack.push(j);
+      }
+    }
+    if (members.length < n * 0.004 && nearEdge) for (const i of members) bg[i] = 1;
+  }
+  let moved = 0;
+  for (let i = 0; i < n; i++) if (bg[i] && labels[i] === id) { labels[i] = BG; moved++; }
+  return moved;
+}
+
 // 找出每種線要標數字的位置：每個大區塊裡「離邊界最遠」的點
 export function labelPositions(labels, w, h, ids) {
   const scale = Math.min(1, 180 / Math.max(w, h));

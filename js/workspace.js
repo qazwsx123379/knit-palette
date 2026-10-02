@@ -126,6 +126,15 @@ export function createWorkspace(app) {
     S.undo = [];
   }
 
+  // 自動把背景（平滑的桌面）分開成「不換色」，同顏色但有針目紋理的毛線保留下來
+  // 回傳分出來的背景佔整張圖的比例
+  function autoBackground() {
+    if (S.bgSuspect == null) return 0;
+    const moved = Seg.separateBackground(S.prep, S.labels, S.bgSuspect);
+    if (moved) recompute({ renumber: S.mode === 'detect' });
+    return moved / S.prep.n;
+  }
+
   function pushUndo() {
     S.undo.push({ labels: S.labels.slice(), groups: JSON.parse(JSON.stringify(S.groups)), selected: S.selected });
     if (S.undo.length > 20) S.undo.shift();
@@ -158,10 +167,11 @@ export function createWorkspace(app) {
       await nextFrame();
       S = newSession(imageToCanvas(img));
       regroup();
+      const bgShare = autoBackground();
       S.dirty = true;
       busy.close();
       drawAll();
-      toast(`找到 ${S.groups.length} 種線`);
+      toast(bgShare > 0.05 ? `找到 ${S.groups.length} 種線，背景（桌面）已自動設為不換色` : `找到 ${S.groups.length} 種線`);
     } catch (e) {
       busy.close();
       toast(e.message || '圖片處理失敗', 'error');
@@ -537,6 +547,7 @@ export function createWorkspace(app) {
       const busy = loading('重新辨識中…');
       await nextFrame();
       regroup();
+      autoBackground();
       busy.close();
       markDirty();
       refresh();
@@ -779,13 +790,23 @@ export function createWorkspace(app) {
     const g = groupById(id);
     if (!g) return;
     pushUndo();
-    for (let i = 0; i < S.labels.length; i++) if (S.labels[i] === id) S.labels[i] = BG;
+    const before = g.count;
+    // 先用紋理把平滑的桌面分出來；分不出多少（例如桌面也有花紋）時，才把整種線設為背景
+    const moved = Seg.separateBackground(S.prep, S.labels, id);
+    let msg;
+    if (moved > before * 0.3) {
+      msg = `已把背景（桌面）設為不換色，${g.n} 號裡有紋理的毛線保留下來。可以按「復原」`;
+    } else {
+      for (let i = 0; i < S.labels.length; i++) if (S.labels[i] === id) S.labels[i] = BG;
+      msg = `已把 ${g.n} 號整個設為背景（不換色）。可以按「復原」`;
+    }
     S.manual = true;
     if (S.selected === id) S.selected = null;
     recompute({ renumber: S.mode === 'detect' });
+    S.bgIgnore = null;
     markDirty();
     refresh();
-    toast(`已把 ${g.n} 號設為背景（不換色）。可以按「復原」`);
+    toast(msg);
   }
 
   function toggleBrush() {
