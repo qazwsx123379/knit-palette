@@ -410,32 +410,33 @@ export function separateBackground(prep, labels, id) {
     }
     if (members.length >= minArea) for (const i of members) bg[i] = 1;
   }
-  // 背景和毛線的平均顏色
-  const sumB = [0, 0, 0], sumY = [0, 0, 0];
-  let nb = 0, ny = 0;
+  // 背景的平均顏色
+  const sumB = [0, 0, 0];
+  let nb = 0;
   for (let i = 0; i < n; i++) {
-    if (labels[i] !== id) continue;
-    const t = bg[i] ? sumB : sumY;
-    t[0] += lab[i * 3]; t[1] += lab[i * 3 + 1]; t[2] += lab[i * 3 + 2];
-    if (bg[i]) nb++; else ny++;
+    if (labels[i] !== id || !bg[i]) continue;
+    sumB[0] += lab[i * 3]; sumB[1] += lab[i * 3 + 1]; sumB[2] += lab[i * 3 + 2];
+    nb++;
   }
   if (!nb) return 0;
-  const cb = sumB.map((v) => v / nb), cy = ny ? sumY.map((v) => v / ny) : cb;
-  // 交界附近（紋理計算會往外暈開一點）：顏色比較像背景的，也算背景
-  const near = new Uint8Array(n);
-  for (let i = 0; i < n; i++) if (bg[i]) near[i] = 1;
-  for (let pass = 0; pass < r + 2; pass++) {
+  const cb = sumB.map((v) => v / nb);
+  // 交界附近（紋理是看一個範圍算的，會往外暈開幾個像素）：
+  // 用更小的範圍重新看紋理，平滑的算背景；一圈一圈往外推，碰到毛線就停
+  const tex2 = blurR(hp, 1);
+  const bgL = cb[0];
+  for (let pass = 0; pass < r * 3; pass++) {
     const grow = [];
     for (let i = 0; i < n; i++) {
-      if (near[i] || labels[i] !== id) continue;
+      if (bg[i] || labels[i] !== id) continue;
       const x = i % w;
-      if ((x > 0 && near[i - 1]) || (x < w - 1 && near[i + 1]) || (i >= w && near[i - w]) || (i + w < n && near[i + w])) grow.push(i);
+      if ((x > 0 && bg[i - 1]) || (x < w - 1 && bg[i + 1]) || (i >= w && bg[i - w]) || (i + w < n && bg[i + w])) grow.push(i);
     }
+    let added = 0;
     for (const i of grow) {
-      near[i] = 2;
-      const d = (c) => (lab[i * 3] - c[0]) ** 2 + (lab[i * 3 + 1] - c[1]) ** 2 + (lab[i * 3 + 2] - c[2]) ** 2;
-      if (d(cb) <= d(cy)) bg[i] = 1;
+      // 很平滑（陰影漸層也算），或是平滑又跟背景差不多亮
+      if (tex2[i] < TEX_SMOOTH * 1.2 || (tex2[i] < TEX_SMOOTH * 1.8 && Math.abs(lab[i * 3] - bgL) < 4)) { bg[i] = 1; added++; }
     }
+    if (!added) break;
   }
   // 剩下的「毛線」裡，靠近圖片邊緣又很小塊的（浮水印、雜點）也算背景；作品中間的小點（裝飾針）保留
   const edge = Math.round(Math.min(w, h) * 0.04);

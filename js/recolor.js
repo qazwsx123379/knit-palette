@@ -5,8 +5,8 @@
 //    這樣即使一種線裡混了原本不同的顏色（例如白色花邊加棕色細圈），整片都會換成新顏色，不會白的還是白的
 // 2. 紋理強弱調整成「新顏色的真實毛線大概會有的程度」
 //    （用 EX991 色卡上 16 種真實毛線量過：中間色大約 6–8，接近白色時只有 3 左右）
-// 3. 大範圍的明暗（光線方向）保留一點點，看起來比較立體
-// 4. 最亮、最暗的地方柔和收邊；越亮越接近白色（反光），越暗彩度越低
+// 3. 大範圍的明暗（光線方向、陰影）保留六成，看起來比較立體
+// 4. 暗的地方（針目凹陷）顏色更深更飽和，不會變灰；只有最亮的地方往白色靠（反光）
 import { hexToLab, labToRgb } from './color.js';
 import { BG } from './segment.js';
 
@@ -50,9 +50,9 @@ function localMeanL(prep, labels, id, r) {
 
 // 真實毛線照片在這個亮度下大概的光影起伏
 function naturalTexture(L) {
-  if (L > 90) return 7 - ((L - 90) / 10) * 4; // 越接近白色越淡
-  if (L < 20) return 5.5 + (L / 20) * 1.5;
-  return 7;
+  if (L > 90) return 8 - ((L - 90) / 10) * 4.5; // 越接近白色越淡
+  if (L < 20) return 6 + (L / 20) * 2;
+  return 8;
 }
 
 // 柔和收邊：超過 92 或低於 6 時慢慢靠近極限，不會切成一整片
@@ -83,7 +83,7 @@ export function recolor(prep, labels, targets, out) {
     if (!c) continue;
     const sd = Math.sqrt(Math.max(0, s2 / c - (s / c) ** 2));
     const [tL, ta, tb] = hexToLab(t.hex);
-    let k = Math.max(0.6, Math.min(2.2, naturalTexture(tL) / Math.max(1.2, sd)));
+    let k = Math.max(0.6, Math.min(3, naturalTexture(tL) / Math.max(1.2, sd)));
     // 幾乎沒有紋理的地方（背景、平滑的布）不要放大，不然會把照片雜訊放大成斑紋
     if (sd < 2.2) k = Math.min(k, 1.1);
     plan[id] = { tL, ta, tb, mean: sum / c, sa: t.srcLab[1], sb: t.srcLab[2], k };
@@ -99,14 +99,14 @@ export function recolor(prep, labels, targets, out) {
     }
     const L = lab[i * 3], a = lab[i * 3 + 1], b = lab[i * 3 + 2];
     const lm = local[l][i];
-    // 大範圍的明暗只留一點，避免原本不同顏色的部分換色後還是一塊亮一塊暗
-    const shade = Math.max(-8, Math.min(8, (lm - p.mean) * 0.3));
+    // 大範圍的明暗（陰影、光線方向）保留六成；有上限，避免原本不同顏色的部分換色後一塊亮一塊暗
+    const shade = Math.max(-14, Math.min(10, (lm - p.mean) * 0.6));
     const L2 = softClip(p.tL + shade + (L - lm) * p.k);
-    // 彩度：比平均暗的地方稍微降低；比平均亮的地方往白色靠
+    // 彩度：真的毛線在凹陷處顏色更深、更飽和，所以暗的地方不降低（深色時稍微加一點）；
+    // 比平均亮的地方才往白色靠，像反光
     let cs;
-    if (L2 <= p.tL) cs = 0.8 + 0.2 * (L2 / Math.max(p.tL, 1));
-    else cs = Math.max(0.25, (100 - L2) / Math.max(6, 100 - p.tL));
-    if (cs > 1) cs = 1;
+    if (L2 <= p.tL) cs = 1 + 0.12 * Math.min(1, (p.tL - L2) / 25);
+    else cs = Math.max(0.3, 1 - ((L2 - p.tL) / Math.max(8, 100 - p.tL)) * 0.85);
     // 原本的色偏只留一點點，而且有上限：不然原本是橘色的地方換成白色後會帶著橘色
     const da = Math.max(-4, Math.min(4, (a - p.sa) * 0.2));
     const db = Math.max(-4, Math.min(4, (b - p.sb) * 0.2));

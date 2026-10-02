@@ -1,5 +1,5 @@
 // 讓 App 可以加到主畫面。App 本身的檔案先從網路拿最新版，網路不通時才用快取
-const CACHE = 'knit-palette-v11';
+const CACHE = 'knit-palette-v12';
 const SHELL = [
   './', 'index.html', 'css/style.css', 'manifest.webmanifest',
   'js/main.js', 'js/ui.js', 'js/color.js', 'js/segment.js', 'js/recolor.js', 'js/swatches.js', 'js/ocr.js',

@@ -589,7 +589,9 @@ export function createWorkspace(app) {
             : null
         ),
         h('div', { class: 'tool-grid' },
-          button('復原', { icon: 'undo', onClick: undo, disabled: !S.undo.length }),
+          S.ai.on && S.ai.points.length
+            ? button('收回上一個點', { icon: 'undo', id: 'btn-ai-undo', onClick: undoAiPoint })
+            : button('復原', { icon: 'undo', onClick: undo, disabled: !S.undo.length }),
           button(`關閉${toolName}`, { icon: 'close', id: S.ai.on ? 'btn-ai' : null, onClick: () => { if (S.ai.on) toggleAi(); else if (S.brush.on) toggleBrush(); else toggleWand(); } })
         ),
         button('辨識完成，開始配色', { kind: 'primary block', onClick: () => setMode('color') })
@@ -782,6 +784,17 @@ export function createWorkspace(app) {
     return out;
   }
 
+  // 收回上一個點（AI 圈選中）
+  function undoAiPoint() {
+    S.ai.points.pop();
+    if (S.ai.points.some((p) => p.include)) runAi();
+    else {
+      S.ai.mask = null;
+      S.ai.options = [];
+      refresh();
+    }
+  }
+
   // 連續點很快時，只算最新的那一次
   let aiRun = 0;
   async function runAi() {
@@ -798,7 +811,17 @@ export function createWorkspace(app) {
     renderPanel();
     renderCanvas();
     try {
-      const raw = await selectByPoints(S.ai.handle, S.ai.points);
+      // 綠點交給 AI 找範圍；紅點不直接給 AI（它對排除點的反應不穩定），
+      // 改成「找出紅點那個東西的最小範圍，再從選取範圍扣掉」
+      const inc = S.ai.points.filter((p) => p.include);
+      const exc = S.ai.points.filter((p) => !p.include);
+      const raw = await selectByPoints(S.ai.handle, inc);
+      for (const e of exc) {
+        const parts = await selectByPoints(S.ai.handle, [{ x: e.x, y: e.y, include: true }]);
+        const cut = parts.find((o) => o.area > 0.0005) || parts[0];
+        if (!cut) continue;
+        for (const o of raw) for (let i = 0; i < o.mask.length; i++) if (cut.mask[i]) o.mask[i] = 0;
+      }
       if (my !== aiRun || session !== S) return;
       // 只留下跟綠點連在一起的那一塊，散落的小點、小洞清掉
       const options = raw.map((o) => {
