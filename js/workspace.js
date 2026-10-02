@@ -11,6 +11,7 @@ const WORK_MAX = 1100; // 作品圖的處理尺寸（長邊像素）
 const DEFAULT_SENS = 55;
 const REGION_COLORS = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990', '#dcbeff', '#9a6324', '#800000', '#aaffc3', '#000075'];
 const BG = Seg.BG;
+const NEW_LINE = -1; // AI 圈選時「套用成新的一種線」
 
 export function createWorkspace(app) {
   const { data } = app;
@@ -101,7 +102,7 @@ export function createWorkspace(app) {
     for (let y = 1; y < S.h - 1; y++) { add(y * S.w); add(y * S.w + S.w - 1); }
     S.bgSuspect = null;
     for (const g of S.groups) if ((border.get(g.id) || 0) / total > 0.6) S.bgSuspect = g.id;
-    if (S.selected !== null && S.selected !== BG && !groupById(S.selected)) S.selected = null;
+    if (S.selected !== null && S.selected !== BG && S.selected !== NEW_LINE && !groupById(S.selected)) S.selected = null;
   }
 
   // 依敏感度重新分組；已經選好的線，盡量配回顏色最接近的新分組
@@ -547,6 +548,7 @@ export function createWorkspace(app) {
     const sel = S.selected;
     const selGroup = sel !== null && sel !== BG ? groupById(sel) : null;
     const chips = h('div', { class: 'gchips' },
+      S.ai.on ? h('button', { type: 'button', class: `gchip new ${sel === NEW_LINE ? 'on' : ''}`, 'aria-pressed': String(sel === NEW_LINE), onclick: () => selectGroup(NEW_LINE) }, '＋ 新的一種線') : null,
       S.groups.map((g) => groupChip(g, { selected: sel === g.id, onClick: () => selectGroup(g.id) })),
       h('button', { type: 'button', class: `gchip bg ${sel === BG ? 'on' : ''}`, 'aria-pressed': String(sel === BG), onclick: () => selectGroup(BG) }, '背景（不換色）')
     );
@@ -557,7 +559,7 @@ export function createWorkspace(app) {
     tol.addEventListener('input', () => (S.tol = Number(tol.value)));
     const smart = h('input', { type: 'checkbox', id: 'brush-smart', checked: S.brush.smart });
     smart.addEventListener('change', () => { S.brush.smart = smart.checked; renderPanel(); });
-    const target = selGroup ? `${selGroup.n} 號線` : sel === BG ? '背景' : '未選';
+    const target = selGroup ? `${selGroup.n} 號線` : sel === BG ? '背景' : sel === NEW_LINE ? '新的一種線' : '未選';
 
     const suspect = S.bgSuspect != null ? groupById(S.bgSuspect) : null;
     const toolOn = S.ai.on || S.brush.on || S.wand;
@@ -644,7 +646,11 @@ export function createWorkspace(app) {
           }, `${sizeNames[i] || i + 1}（${Math.max(1, Math.round(o.area * 100))}%）`))
         ))
       : null;
+    const bgWarn = S.selected != null && S.selected === S.bgSuspect && S.bgIgnore !== S.bgSuspect
+      ? h('p', { class: 'warn-text' }, `注意：${groupById(S.selected).n} 號線看起來是背景。套用到這裡，之後設成背景時會一起變成不換色。建議選「＋ 新的一種線」。`)
+      : null;
     return h('div', { class: 'tool-box' },
+      bgWarn,
       h('p', { class: 'small', id: 'ai-status' }, status),
       seg,
       sizes,
@@ -652,13 +658,14 @@ export function createWorkspace(app) {
         button(`套用到：${target}`, { kind: 'primary', onClick: applyAi, disabled: !a.mask || a.busy || S.selected === null, id: 'btn-ai-apply' }),
         button('清除重選', { kind: 'ghost', onClick: () => { a.points = []; a.mask = null; a.options = []; a.include = true; refresh(); }, disabled: !a.points.length })
       ),
-      S.selected === null ? h('p', { class: 'small' }, '先在上面「選一種線」，選好的範圍會變成那一種線。') : null
+      S.selected === null ? h('p', { class: 'small' }, '先在上面選好的範圍要變成哪一種線。') : null
     );
   }
 
   async function toggleAi() {
     if (S.ai.on) { stopAi(); refresh(); return; }
     S.ai.on = true;
+    S.selected = NEW_LINE;
     S.brush.on = false;
     S.wand = false;
     refresh();
@@ -685,6 +692,7 @@ export function createWorkspace(app) {
 
   function stopAi() {
     if (!S) return;
+    if (S.selected === NEW_LINE) S.selected = null;
     S.ai.on = false;
     S.ai.points = [];
     S.ai.mask = null;
@@ -728,17 +736,27 @@ export function createWorkspace(app) {
     const { mask } = S.ai;
     if (!mask || S.selected === null) return;
     pushUndo();
+    let target = S.selected;
+    let created = null;
+    if (target === NEW_LINE) {
+      target = unusedId();
+      if (target === null) { toast('線的種類太多了，請先合併一些'); return; }
+      created = { id: target, n: S.groups.reduce((m, g) => Math.max(m, g.n), 0) + 1, srcLab: [50, 0, 0], count: 0, yarn: null };
+      S.groups.push(created);
+    }
     let n = 0;
-    for (let i = 0; i < mask.length; i++) if (mask[i]) { S.labels[i] = S.selected; n++; }
+    for (let i = 0; i < mask.length; i++) if (mask[i]) { S.labels[i] = target; n++; }
     S.ai.points = [];
     S.ai.mask = null;
     S.ai.options = [];
     S.ai.include = true;
     S.manual = true;
-    recompute({ keep: S.selected });
+    recompute({ keep: target });
+    // 套用完，下一次預設還是「新的一種線」
+    if (created) S.selected = NEW_LINE;
     markDirty();
     refresh();
-    toast(n ? '已套用。可以繼續點下一個東西' : '沒有選到任何範圍');
+    toast(!n ? '沒有選到任何範圍' : created ? `已套用成 ${created.n} 號線。可以繼續點下一個東西` : '已套用。可以繼續點下一個東西');
   }
 
   function toggleWand() {
