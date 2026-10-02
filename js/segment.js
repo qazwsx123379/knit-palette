@@ -488,7 +488,103 @@ export function separateBackground(prep, labels, id) {
   }
   let moved = 0;
   for (let i = 0; i < n; i++) if (bg[i] && labels[i] === id) { labels[i] = BG; moved++; }
+  removeShadows(prep, labels, tex2, T);
   return moved;
+}
+
+// 作品投在桌面上的影子：顏色跟背景同色系但比較暗、又平滑，常被分到毛線的群（灰影子併進藍線或杏色線），
+// 換色後會變成一圈假邊。從背景往外一圈一圈推，把這種像素也改成背景；最後把作品外面零星的小碎塊也清掉
+function removeShadows(prep, labels, tex2, T) {
+  const { w, h, n, lab } = prep;
+  const sum = [0, 0, 0];
+  let nb = 0;
+  for (let i = 0; i < n; i++) {
+    if (labels[i] !== BG) continue;
+    sum[0] += lab[i * 3]; sum[1] += lab[i * 3 + 1]; sum[2] += lab[i * 3 + 2];
+    nb++;
+  }
+  if (!nb) return;
+  const [bL, ba, bb] = sum.map((v) => v / nb);
+  const isBg = (i) => labels[i] === BG;
+  const r = Math.max(3, Math.round(Math.max(w, h) * 0.006));
+  for (let pass = 0; pass < r * 4; pass++) {
+    const grow = [];
+    for (let i = 0; i < n; i++) {
+      if (isBg(i)) continue;
+      const x = i % w;
+      if (!((x > 0 && isBg(i - 1)) || (x < w - 1 && isBg(i + 1)) || (i >= w && isBg(i - w)) || (i + w < n && isBg(i + w)))) continue;
+      const dL = bL - lab[i * 3];
+      const dab = Math.hypot(lab[i * 3 + 1] - ba, lab[i * 3 + 2] - bb);
+      const sameHue = dab < 6 + Math.max(0, dL) * 0.2;
+      // 平滑、比背景暗（或差不多亮）、色調跟背景接近
+      if (sameHue && dL > -3 && tex2[i] < T * 1.3) grow.push(i);
+      // 作品貼著桌面的那條深色影子：明顯比背景暗，兩側亮暗變化大所以紋理偏高，只往外推約一個針目寬
+      else if (sameHue && dL > 8 && tex2[i] < T * 2.5 && pass < r * 1.5) grow.push(i);
+    }
+    for (const i of grow) labels[i] = BG;
+    if (!grow.length) break;
+  }
+  // 作品外面零星的小碎塊（木紋上的亮點、影子邊）：不是背景的像素連成一塊，小於整張圖 0.2% 就算背景
+  const seen = new Uint8Array(n);
+  const stack = [];
+  for (let s0 = 0; s0 < n; s0++) {
+    if (seen[s0] || isBg(s0)) continue;
+    const members = [];
+    seen[s0] = 1;
+    stack.push(s0);
+    while (stack.length) {
+      const i = stack.pop();
+      members.push(i);
+      const x = i % w;
+      for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+        if (j < 0 || j >= n || seen[j] || isBg(j)) continue;
+        seen[j] = 1;
+        stack.push(j);
+      }
+    }
+    if (members.length < n * 0.002) for (const i of members) labels[i] = BG;
+  }
+  removeThin(labels, w, h);
+}
+
+// 兩種線交界、或線和背景交界常有 2–6 像素寬的細條被分到第三種線（例如藍線和杏色線之間的深色縫被當成白線），
+// 換色後變成一圈怪色的邊。用 7×7 的「開運算」找出這種細條，改成附近最多的那種線
+function removeThin(labels, w, h) {
+  const n = w * h;
+  const ids = [...new Set(labels)].filter((v) => v !== BG);
+  const thin = new Uint8Array(n);
+  const ind = new Float32Array(n);
+  for (const id of ids) {
+    for (let i = 0; i < n; i++) ind[i] = labels[i] === id ? 1 : 0;
+    const core = boxBlur(ind, w, h, 3);
+    for (let i = 0; i < n; i++) ind[i] = core[i] > 0.999 ? 1 : 0;
+    const keep = boxBlur(ind, w, h, 3);
+    for (let i = 0; i < n; i++) if (labels[i] === id && keep[i] < 0.001) thin[i] = 1;
+  }
+  const out = labels.slice();
+  const cnt = new Map();
+  for (let i = 0; i < n; i++) {
+    if (!thin[i]) continue;
+    const x = i % w, y = (i / w) | 0;
+    cnt.clear();
+    for (let dy = -4; dy <= 4; dy++) {
+      const yy = y + dy;
+      if (yy < 0 || yy >= h) continue;
+      for (let dx = -4; dx <= 4; dx++) {
+        const xx = x + dx;
+        if (xx < 0 || xx >= w) continue;
+        const j = yy * w + xx;
+        if (thin[j]) continue;
+        cnt.set(labels[j], (cnt.get(labels[j]) || 0) + 1);
+      }
+    }
+    // 優先給旁邊的毛線；旁邊只有背景才變背景
+    let best = -1, bc = 0;
+    for (const [v, c] of cnt) if (v !== BG && c > bc) { best = v; bc = c; }
+    if (best < 0 && cnt.has(BG)) best = BG;
+    if (best >= 0) out[i] = best;
+  }
+  labels.set(out);
 }
 
 // 找出每種線要標數字的位置：每個大區塊裡「離邊界最遠」的點
