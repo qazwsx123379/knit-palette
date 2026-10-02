@@ -645,7 +645,7 @@ export function createWorkspace(app) {
       : a.busy ? 'AI 圈選中…'
       : !a.points.length ? '點圖上你要選的東西（例如花邊）。'
       : !hasInclude ? '還沒有綠點。先切到「要這裡」，點你要選的東西。'
-      : a.points.length > 6 ? '點太多了，AI 會被互相矛盾的點搞混。建議按「清除重選」，只在要的東西上點 1–2 個綠點，再切換範圍大小。'
+      : a.points.length > 1 ? '每個綠點會各自找範圍再合起來，沒選到的地方直接再點一個綠點；選太多就在那裡點紅點，或切換「範圍大小」。'
       : '黃框裡亮的地方是選到的範圍。不對就先切換「範圍大小」；還是不對再補 1–2 個點。';
     const sizeNames = ['小', '中', '大'];
     const sizes = a.options.length > 1 && !a.busy
@@ -815,6 +815,7 @@ export function createWorkspace(app) {
 
   // 連續點很快時，只算最新的那一次
   let aiRun = 0;
+  const aiCache = { handle: null, map: new Map() };
   async function runAi() {
     if (!S.ai.points.some((p) => p.include)) {
       S.ai.mask = null;
@@ -833,7 +834,25 @@ export function createWorkspace(app) {
       // 改成「找出紅點那個東西的最小範圍，再從選取範圍扣掉」
       const inc = S.ai.points.filter((p) => p.include);
       const exc = S.ai.points.filter((p) => !p.include);
-      const raw = await selectByPoints(S.ai.handle, inc);
+      // 綠點多的時候，AI 一次看全部點常常只選到其中一部分（例如右邊花邊點了好幾個卻沒選到）。
+      // 所以每個綠點也各自找一次範圍，再全部合起來；3 個點以上就只用各自找的結果
+      let raw = inc.length >= 3 ? null : await selectByPoints(S.ai.handle, inc);
+      if (inc.length > 1) {
+        // 每個點的結果記起來，多點一個點時不用全部重算
+        if (aiCache.handle !== S.ai.handle) { aiCache.handle = S.ai.handle; aiCache.map = new Map(); }
+        for (const p of inc) {
+          const key = `${p.x},${p.y}`;
+          if (!aiCache.map.has(key)) aiCache.map.set(key, await selectByPoints(S.ai.handle, [p]));
+          const one = aiCache.map.get(key);
+          if (!one.length) continue;
+          if (!raw) { raw = one.map((o) => ({ ...o, mask: o.mask.slice() })); continue; }
+          raw.forEach((o, k) => {
+            const m = one[Math.min(k, one.length - 1)].mask;
+            for (let i = 0; i < o.mask.length; i++) if (m[i]) o.mask[i] = 1;
+          });
+        }
+      }
+      raw = raw || [];
       for (const e of exc) {
         const parts = await selectByPoints(S.ai.handle, [{ x: e.x, y: e.y, include: true }]);
         const cut = parts.find((o) => o.area > 0.0005) || parts[0];
