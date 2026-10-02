@@ -1,29 +1,44 @@
-// 換色：保留原本的織紋和陰影，只把顏色換成新的線
+// 換色：保留原本的織紋和光影，只把顏色換成新的線
+// 做法：
+// 1. 每個像素比這種線的平均亮多少、暗多少（光影）照樣搬過去
+// 2. 光影的強弱調整成「新顏色的真實毛線大概會有的程度」
+//    （用 EX991 色卡上 16 種真實毛線量過：中間色大約 6–8，接近白色時只有 3 左右）
+//    白色線照片常常過曝、光影很淡，換成深色時要放大，才不會像平塗一層顏色
+// 3. 最亮、最暗的地方柔和收邊；越亮越接近白色（反光），越暗彩度越低
 import { hexToLab, labToRgb } from './color.js';
 import { BG } from './segment.js';
 
-// 每種線的亮度分布（平均、最暗 2%、最亮 2%），用來決定紋理要保留多少
+// 每種線的亮度平均和起伏（標準差）
 function lightnessStats(prep, labels) {
-  const hist = new Map();
+  const sum = new Float64Array(256), sum2 = new Float64Array(256), cnt = new Float64Array(256);
   const { n, lab } = prep;
   for (let i = 0; i < n; i++) {
     const l = labels[i];
     if (l === BG) continue;
-    let hh = hist.get(l);
-    if (!hh) { hh = new Float64Array(101); hist.set(l, hh); }
-    hh[Math.max(0, Math.min(100, Math.round(lab[i * 3])))]++;
+    const L = lab[i * 3];
+    sum[l] += L; sum2[l] += L * L; cnt[l]++;
   }
   const out = {};
-  for (const [l, hh] of hist) {
-    let total = 0, sum = 0;
-    for (let v = 0; v <= 100; v++) { total += hh[v]; sum += v * hh[v]; }
-    let acc = 0, p2 = 0, p98 = 100;
-    for (let v = 0; v <= 100; v++) { acc += hh[v]; if (acc >= total * 0.02) { p2 = v; break; } }
-    acc = 0;
-    for (let v = 100; v >= 0; v--) { acc += hh[v]; if (acc >= total * 0.02) { p98 = v; break; } }
-    out[l] = { mean: sum / total, p2, p98 };
+  for (let l = 0; l < 256; l++) {
+    if (!cnt[l]) continue;
+    const mean = sum[l] / cnt[l];
+    out[l] = { mean, sd: Math.sqrt(Math.max(0, sum2[l] / cnt[l] - mean * mean)) };
   }
   return out;
+}
+
+// 真實毛線照片在這個亮度下大概的光影起伏
+function naturalTexture(L) {
+  if (L > 90) return 7 - ((L - 90) / 10) * 4; // 越接近白色越淡
+  if (L < 20) return 5.5 + (L / 20) * 1.5;
+  return 7;
+}
+
+// 柔和收邊：超過 92 或低於 6 時慢慢靠近極限，不會切成一整片
+function softClip(L) {
+  if (L > 92) return 92 + 7.5 * (1 - Math.exp(-(L - 92) / 7.5));
+  if (L < 6) return 6 * Math.exp((L - 6) / 6);
+  return L;
 }
 
 // targets: { [labelId]: { srcLab, hex } }，沒有指定的線維持原色
@@ -36,10 +51,7 @@ export function recolor(prep, labels, targets, out) {
     if (!t || !t.hex || !t.srcLab || !stats[id]) continue;
     const [tL, ta, tb] = hexToLab(t.hex);
     const st = stats[id];
-    // 紋理（亮暗差）照原樣搬過去；新顏色太亮或太暗放不下時才等比例壓縮，避免亮部變成一片白
-    const up = Math.max(1, st.p98 - st.mean), down = Math.max(1, st.mean - st.p2);
-    let k = Math.min(1, (99 - tL) / up, (tL - 3) / down);
-    k = Math.max(0.45, k);
+    const k = Math.max(0.6, Math.min(2.5, naturalTexture(tL) / Math.max(1.5, st.sd)));
     plan[id] = { tL, ta, tb, sL: st.mean, sa: t.srcLab[1], sb: t.srcLab[2], k };
   }
   for (let i = 0; i < n; i++) {
@@ -51,18 +63,16 @@ export function recolor(prep, labels, targets, out) {
       continue;
     }
     const L = lab[i * 3], a = lab[i * 3 + 1], b = lab[i * 3 + 2];
-    let L2 = p.tL + (L - p.sL) * p.k;
-    if (L2 > 99.5) L2 = 99.5 - (L2 - 99.5) * 0.1;
-    if (L2 < 1) L2 = 1;
-    // 越暗的地方彩度稍微低一點，看起來比較自然；保留一點原本的色偏變化
-    let cs = 0.8 + 0.2 * (L2 / Math.max(p.tL, 1));
-    if (cs > 1.1) cs = 1.1;
+    const L2 = softClip(p.tL + (L - p.sL) * p.k);
+    // 彩度：比平均暗的地方稍微降低；比平均亮的地方往白色靠
+    let cs;
+    if (L2 <= p.tL) cs = 0.8 + 0.2 * (L2 / Math.max(p.tL, 1));
+    else cs = Math.max(0.25, (100 - L2) / Math.max(6, 100 - p.tL));
+    if (cs > 1) cs = 1;
     // 原本的色偏只留一點點，而且有上限：不然原本是橘色的地方換成白色後會帶著橘色
     const da = Math.max(-4, Math.min(4, (a - p.sa) * 0.2));
     const db = Math.max(-4, Math.min(4, (b - p.sb) * 0.2));
-    const a2 = p.ta * cs + da;
-    const b2 = p.tb * cs + db;
-    const [r, g, bb] = labToRgb(L2, a2, b2);
+    const [r, g, bb] = labToRgb(L2, p.ta * cs + da, p.tb * cs + db);
     dst[o] = r; dst[o + 1] = g; dst[o + 2] = bb; dst[o + 3] = 255;
   }
   smoothEdges(labels, w, h, dst, plan);
