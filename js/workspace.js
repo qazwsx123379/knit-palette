@@ -37,7 +37,7 @@ export function createWorkspace(app) {
       selected: null,
       brush: { on: false, size: 30, smart: true },
       wand: false,
-      ai: { on: false, handle: null, points: [], mask: null, options: [], pick: 0, size: 0, include: true, busy: false },
+      ai: { on: false, bgMode: false, handle: null, points: [], mask: null, options: [], pick: 0, size: 0, include: true, busy: false },
       tol: 14, // 智慧筆刷、魔術棒的顏色容許範圍
       showRegions: false,
       hold: false,
@@ -579,7 +579,7 @@ export function createWorkspace(app) {
     if (toolOn) {
       const toolName = S.ai.on ? 'AI 圈選' : S.brush.on ? '筆刷' : '魔術棒';
       return h('div', { class: 'panel-body' },
-        h('div', { class: 'field' }, h('span', {}, '選好的範圍要變成哪一種線'), chips),
+        S.ai.bgMode ? h('p', { class: 'lead' }, 'AI 去背景') : h('div', { class: 'field' }, h('span', {}, '選好的範圍要變成哪一種線'), chips),
         S.ai.on ? aiBox(target) : h('div', { class: 'tool-box' },
           h('p', { class: 'small' }, S.brush.on ? `在圖上塗，塗到的地方會變成：${target}` : `點圖上的一個地方，相連又相近的顏色會變成：${target}`),
           S.brush.on ? h('label', { class: 'field' }, h('span', {}, '筆刷大小'), brushSize) : null,
@@ -660,6 +660,19 @@ export function createWorkspace(app) {
           }, `${sizeNames[i] || i + 1}（${Math.max(1, Math.round(o.area * 100))}%）`))
         ))
       : null;
+    if (a.bgMode) {
+      const st = !a.handle ? '準備中…' : a.busy ? 'AI 找作品範圍中…'
+        : !a.points.length ? '點一下作品本身（任何地方都可以），AI 會找出整件作品。'
+        : '亮的地方是作品，變暗的會設為背景。作品沒選完整：切換「範圍大小」或在漏掉的地方再點一下。';
+      return h('div', { class: 'tool-box' },
+        h('p', { class: 'small', id: 'ai-status' }, st),
+        sizes,
+        h('div', { class: 'row-actions' },
+          button('作品以外都設為背景', { kind: 'primary', onClick: applyAi, disabled: !a.mask || a.busy, id: 'btn-ai-apply' }),
+          button('清除重選', { kind: 'ghost', onClick: () => { a.points = []; a.mask = null; a.options = []; refresh(); }, disabled: !a.points.length })
+        )
+      );
+    }
     const bgWarn = S.selected != null && S.selected === S.bgSuspect && S.bgIgnore !== S.bgSuspect
       ? h('p', { class: 'warn-text' }, `注意：${groupById(S.selected).n} 號線看起來是背景。套用到這裡，之後設成背景時會一起變成不換色。建議選「＋ 新的一種線」。`)
       : null;
@@ -676,9 +689,13 @@ export function createWorkspace(app) {
     );
   }
 
-  async function toggleAi() {
-    if (S.ai.on) { stopAi(); refresh(); return; }
+  async function toggleAi(bgMode = false) {
+    if (S.ai.on && !(bgMode === true && !S.ai.bgMode)) { stopAi(); refresh(); return; }
     S.ai.on = true;
+    S.ai.bgMode = bgMode === true;
+    S.ai.points = [];
+    S.ai.mask = null;
+    S.ai.options = [];
     S.selected = NEW_LINE;
     S.brush.on = false;
     S.wand = false;
@@ -695,7 +712,7 @@ export function createWorkspace(app) {
       S.ai.handle = handle;
       busy.close();
       refresh();
-      toast('AI 準備好了，點圖上要選的東西');
+      toast(S.ai.bgMode ? 'AI 準備好了，點一下作品本身' : 'AI 準備好了，點圖上要選的東西');
     } catch (e) {
       busy.close();
       S.ai.on = false;
@@ -708,6 +725,7 @@ export function createWorkspace(app) {
     if (!S) return;
     if (S.selected === NEW_LINE) S.selected = null;
     S.ai.on = false;
+    S.ai.bgMode = false;
     S.ai.points = [];
     S.ai.mask = null;
     S.ai.options = [];
@@ -831,7 +849,11 @@ export function createWorkspace(app) {
         return { ...o, mask, area: area / mask.length };
       });
       // 預設用最小的範圍（AI 最有把握的常常是整件作品，太大）；使用者切換過大小，就沿用他選的
-      const pick = Math.min(S.ai.size, options.length - 1);
+      let pick = Math.min(S.ai.size, options.length - 1);
+      if (S.ai.bgMode) {
+        pick = 0;
+        options.forEach((o, i) => { if (o.area < 0.9 && o.area >= options[pick].area) pick = i; });
+      }
       S.ai.options = options;
       S.ai.pick = pick;
       S.ai.mask = options.length ? options[pick].mask : null;
@@ -847,6 +869,20 @@ export function createWorkspace(app) {
 
   function applyAi() {
     const { mask } = S.ai;
+    if (S.ai.bgMode) {
+      if (!mask) return;
+      pushUndo();
+      let n = 0;
+      for (let i = 0; i < mask.length; i++) if (!mask[i] && S.labels[i] !== BG) { S.labels[i] = BG; n++; }
+      S.manual = true;
+      stopAi();
+      recompute({ renumber: true });
+      S.selected = null;
+      markDirty();
+      refresh();
+      toast(n ? '作品以外都設為背景了（不換色）。不對可以按「復原」' : '沒有改變');
+      return;
+    }
     if (!mask || S.selected === null) return;
     pushUndo();
     let target = S.selected;
@@ -882,8 +918,9 @@ export function createWorkspace(app) {
   // 「這種線看起來是背景」的一行提示（調整辨識和配色都會出現）
   function bgNoticeEl(suspect) {
     return h('div', { class: 'notice compact' },
-      h('span', {}, `${suspect.n} 號線看起來是背景，換色會連桌面一起變。`),
-      button('設為背景', { kind: 'small primary', id: 'btn-bg', onClick: () => setBackground(suspect.id) }),
+      h('span', {}, `${suspect.n} 號線裡混了背景（桌面），換色會連桌面一起變。`),
+      button('AI 去背景', { kind: 'small primary', id: 'btn-ai-bg', title: '點一下作品，作品以外都設為背景', onClick: () => { if (S.mode !== 'detect') setMode('detect'); toggleAi(true); } }),
+      button('整個設為背景', { kind: 'small', id: 'btn-bg', onClick: () => setBackground(suspect.id) }),
       button('不是', { kind: 'small ghost', onClick: () => { S.bgIgnore = suspect.id; renderPanel(); } })
     );
   }

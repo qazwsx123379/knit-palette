@@ -105,6 +105,7 @@ export function clusterImage(prep, k = 12) {
   const sample = [];
   for (let i = 0; i < n; i += step) sample.push(i);
   const { centers } = kmeans(lab, sample, k);
+  const scale = chromaScale(lab, sample);
   const sub = new Uint8Array(n);
   const counts = new Float64Array(centers.length);
   for (let i = 0; i < n; i++) {
@@ -116,7 +117,7 @@ export function clusterImage(prep, k = 12) {
     sub[i] = best;
     counts[best]++;
   }
-  return { sub, centers, counts: Array.from(counts) };
+  return { sub, centers, counts: Array.from(counts), chromaScale: scale };
 }
 
 // 敏感度 0–100 → 合併門檻。敏感度越高，分出的線越多
@@ -128,9 +129,18 @@ export function thresholdFor(sensitivity) {
 // 合併距離時亮度的權重較低：同一種線的亮面和陰影比較容易被視為同一種
 const MERGE_WL = 0.55;
 
-function mergeDist(a, b) {
+// cs：顏色差距的放大倍數。照片整體顏色很淡（光線暗、偏黃、粉彩色線）時放大，
+// 才不會把淡藍、淡橘和桌面當成同一種線
+function mergeDist(a, b, cs = 1) {
   const dL = (a[0] - b[0]) * MERGE_WL;
-  return Math.sqrt(dL * dL + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2);
+  return Math.sqrt(dL * dL + ((a[1] - b[1]) * cs) ** 2 + ((a[2] - b[2]) * cs) ** 2);
+}
+
+// 照片的鮮豔程度：取樣像素彩度的第 90 百分位；越淡放大越多（1–2.5 倍）
+function chromaScale(lab, indices) {
+  const cs = indices.map((i) => Math.hypot(lab[i * 3 + 1], lab[i * 3 + 2])).sort((a, b) => a - b);
+  const p90 = cs[Math.floor(cs.length * 0.9)] || 30;
+  return Math.max(1, Math.min(2.5, 32 / Math.max(p90, 1)));
 }
 
 // 第二步：依敏感度把小色群合併成「線」
@@ -153,7 +163,7 @@ export function groupClusters(cluster, sensitivity) {
     let bi = -1, bj = -1, bd = Infinity;
     for (let i = 0; i < groups.length; i++) {
       for (let j = i + 1; j < groups.length; j++) {
-        const d = mergeDist(groups[i].lab, groups[j].lab);
+        const d = mergeDist(groups[i].lab, groups[j].lab, cluster.chromaScale || 1);
         if (d < bd) { bd = d; bi = i; bj = j; }
       }
     }
@@ -169,7 +179,7 @@ export function groupClusters(cluster, sensitivity) {
     let bj = -1, bd = Infinity;
     for (let j = 0; j < groups.length; j++) {
       if (j === idx) continue;
-      const d = mergeDist(groups[idx].lab, groups[j].lab);
+      const d = mergeDist(groups[idx].lab, groups[j].lab, cluster.chromaScale || 1);
       if (d < bd) { bd = d; bj = j; }
     }
     const [keep, drop] = groups[bj].count >= groups[idx].count ? [bj, idx] : [idx, bj];
