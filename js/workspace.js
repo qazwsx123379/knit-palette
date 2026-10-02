@@ -9,6 +9,10 @@ import { loadSam, analyzeImage, selectByPoints } from './sam.js';
 
 const WORK_MAX = 1100; // 作品圖的處理尺寸（長邊像素）
 const DEFAULT_SENS = 55;
+const SPLIT_KEY = 'knit-palette.splitRegions';
+function readSplit() {
+  try { return localStorage.getItem(SPLIT_KEY) !== '0'; } catch { return true; }
+}
 const REGION_COLORS = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990', '#dcbeff', '#9a6324', '#800000', '#aaffc3', '#000075'];
 const BG = Seg.BG;
 const NEW_LINE = -1; // AI 圈選時「套用成新的一種線」
@@ -32,6 +36,7 @@ export function createWorkspace(app) {
       groups: [],
       positions: {},
       sensitivity: DEFAULT_SENS,
+      splitRegions: readSplit(),
       manual: false,
       mode: 'detect',
       selected: null,
@@ -132,7 +137,14 @@ export function createWorkspace(app) {
     // 只是某種線的暗部、縫、影子的群不是真的線，先交還給旁邊的線，再分背景
     const dissolved = Seg.dissolveEdgeGroups(S.prep, S.labels);
     const moved = S.bgSuspect == null ? 0 : Seg.separateBackground(S.prep, S.labels, S.bgSuspect);
-    if (moved || dissolved) recompute({ renumber: S.mode === 'detect' });
+    // 同一種顏色、但在作品上是分開的區塊（例如花邊和花心），各自當成一種線，才能配不同顏色
+    let split = 0;
+    if (S.splitRegions) {
+      const made = Seg.splitRegions(S.labels, S.w, S.h, S.groups.map((g) => g.id));
+      for (const id of made) S.groups.push({ id, n: 0, srcLab: [50, 0, 0], count: 0, yarn: null });
+      split = made.length;
+    }
+    if (moved || dissolved || split) recompute({ renumber: S.mode === 'detect' });
     return moved / S.prep.n;
   }
 
@@ -556,6 +568,23 @@ export function createWorkspace(app) {
     });
     const regions = h('input', { type: 'checkbox', id: 'show-regions', checked: S.showRegions });
     regions.addEventListener('change', () => { S.showRegions = regions.checked; refresh(); });
+    const splitBox = h('input', { type: 'checkbox', id: 'split-regions', checked: S.splitRegions });
+    splitBox.addEventListener('change', async () => {
+      if (S.manual && !(await confirmDialog('重新分組？', '會重新辨識，你手動修改過的區域會被清除。', '重新分組'))) {
+        splitBox.checked = S.splitRegions;
+        return;
+      }
+      S.splitRegions = splitBox.checked;
+      try { localStorage.setItem(SPLIT_KEY, S.splitRegions ? '1' : '0'); } catch { /* 無痕模式存不了，不影響這次 */ }
+      const busy = loading('重新辨識中…');
+      await nextFrame();
+      regroup();
+      autoBackground();
+      busy.close();
+      markDirty();
+      refresh();
+      toast(`找到 ${S.groups.length} 種線`);
+    });
 
     const sel = S.selected;
     const selGroup = sel !== null && sel !== BG ? groupById(sel) : null;
@@ -607,6 +636,7 @@ export function createWorkspace(app) {
         h('span', { class: 'range-labels' }, h('span', {}, '少一點線'), h('span', {}, '多一點線'))
       ),
       h('label', { class: 'check' }, regions, h('span', {}, '顯示區域色塊')),
+      h('label', { class: 'check' }, splitBox, h('span', {}, '同顏色、不同區塊分開成不同的線')),
       h('div', { class: 'field' }, h('span', {}, '選一種線'), chips),
       h('p', { class: 'muted small' }, selGroup ? `已選 ${selGroup.n} 號線。` : sel === BG ? '已選背景。用筆刷可以把區域改成背景。' : '也可以直接點圖片上的區域。'),
       h('div', { class: 'tool-grid' },

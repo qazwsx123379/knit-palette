@@ -373,7 +373,7 @@ export function fillHoles(labels, w, h, value, passes = 3) {
 const ISO_K = 2.7, ISO_MIN = 0.3, ISO_MAX = 1.0;
 
 // 方框模糊（半徑 r）
-function boxBlur(src, w, h, r) {
+export function boxBlur(src, w, h, r) {
   const n = w * h, tmp = new Float32Array(n), out = new Float32Array(n), k = 2 * r + 1;
   for (let y = 0; y < h; y++) {
     let a = 0;
@@ -389,7 +389,7 @@ function boxBlur(src, w, h, r) {
 }
 
 // 四個方向（橫、直、兩個斜向）的亮度變化，各自在半徑 rr 內平均，取最小的那個方向
-function isoTexture(L, w, h, rr) {
+export function isoTexture(L, w, h, rr) {
   const n = w * h;
   const b = boxBlur(L, w, h, 1);
   const d = [0, 1, 2, 3].map(() => new Float32Array(n));
@@ -472,6 +472,81 @@ export function separateBackground(prep, labels, id) {
   for (let i = 0; i < n; i++) {
     if (labels[i] === BG || bg[i]) state[i] = 1;
     else if (labels[i] !== id || yarnCore[i] > 0.999) state[i] = 2;
+  }
+  // 鏤空花邊的洞：洞裡露出的桌面被毛線圍住，大範圍的紋理會被毛線暈到，找不到。
+  // 改看小範圍：平滑、比附近確定是毛線的部分暗很多（不到 80%）、連成一小塊（至少約兩個針目大小）的，當成背景的起點
+  {
+    const ys = [];
+    for (let i = 0; i < n; i += 3) if (labels[i] === id && state[i] === 2) ys.push(lab[i * 3]);
+    if (ys.length > 100) {
+      ys.sort((a, b) => a - b);
+      const medY = ys[ys.length >> 1];
+      const texS = isoTexture(L, w, h, 2);
+      // 跟「附近」的毛線比亮度（光線不均勻時，暗的那一邊的毛線不能被當成洞）
+      const ym = new Float32Array(n), yl = new Float32Array(n);
+      for (let i = 0; i < n; i++) if (labels[i] === id && state[i] === 2) { ym[i] = 1; yl[i] = lab[i * 3]; }
+      const bym = boxBlur(ym, w, h, r * 10), byl = boxBlur(yl, w, h, r * 10);
+      const refY = (i) => (bym[i] > 0.02 ? byl[i] / bym[i] : medY);
+      const cand = new Uint8Array(n);
+      for (let i = 0; i < n; i++) if (labels[i] === id && state[i] !== 1 && texS[i] < Math.max(T * 2, 1.5) && lab[i * 3] < refY(i) * 0.8) cand[i] = 1;
+      const seenH = new Uint8Array(n);
+      const minHole = r * r * 2;
+      for (let s0 = 0; s0 < n; s0++) {
+        if (!cand[s0] || seenH[s0]) continue;
+        const members = [];
+        seenH[s0] = 1;
+        stack.push(s0);
+        while (stack.length) {
+          const i = stack.pop();
+          members.push(i);
+          const x = i % w;
+          for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+            if (j < 0 || j >= n || !cand[j] || seenH[j]) continue;
+            seenH[j] = 1;
+            stack.push(j);
+          }
+        }
+        if (members.length >= minHole) for (const i of members) state[i] = 1;
+      }
+      // 洞的範圍：從找到的洞往外，比附近毛線暗的（不到 85%）都算洞，最多推一個針目寬
+      let front = [];
+      for (let i = 0; i < n; i++) if (state[i] === 1 && labels[i] === id && seenH[i] && cand[i]) front.push(i);
+      for (let pass = 0; pass < r && front.length; pass++) {
+        const next = [];
+        for (const i of front) {
+          const x = i % w;
+          for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+            if (j < 0 || j >= n || labels[j] !== id || state[j] === 1 || lab[j * 3] >= refY(j) * 0.85) continue;
+            state[j] = 1;
+            next.push(j);
+          }
+        }
+        front = next;
+      }
+    }
+  }
+  // 顏色也能幫忙時就用：確定是背景的和確定是毛線的，如果色調（a、b，不管亮度）差得夠多
+  // （例如灰色桌面和米白毛線），其他像素看色調比較接近哪一邊，很明顯的就直接定下來。
+  // 鏤空花邊的洞裡露出的桌面，四周都是毛線、紋理會被暈到，只能靠顏色認出來。木紋桌和白線色調一樣，這步不會作用
+  const cB = [0, 0], cY = [0, 0];
+  let nB = 0, nY = 0;
+  for (let i = 0; i < n; i++) {
+    if (labels[i] !== id) continue;
+    if (state[i] === 1) { cB[0] += lab[i * 3 + 1]; cB[1] += lab[i * 3 + 2]; nB++; }
+    else if (state[i] === 2) { cY[0] += lab[i * 3 + 1]; cY[1] += lab[i * 3 + 2]; nY++; }
+  }
+  if (nB > n * 0.01 && nY > n * 0.002) {
+    const mB = [cB[0] / nB, cB[1] / nB], mY = [cY[0] / nY, cY[1] / nY];
+    const sep = Math.hypot(mB[0] - mY[0], mB[1] - mY[1]);
+    if (sep > 5) {
+      for (let i = 0; i < n; i++) {
+        if (labels[i] !== id || state[i]) continue;
+        const a = lab[i * 3 + 1], b = lab[i * 3 + 2];
+        const dB = Math.hypot(a - mB[0], b - mB[1]), dY = Math.hypot(a - mY[0], b - mY[1]);
+        if (dB < sep * 0.3 && dB < dY * 0.4) state[i] = 1;
+        else if (dY < sep * 0.3 && dY < dB * 0.4) state[i] = 2;
+      }
+    }
   }
   // 亮暗變化（梯度）：用調整過亮度的 L，光線不均勻也一樣
   const Lb = boxBlur(L, w, h, 1);
@@ -872,4 +947,100 @@ export function dissolveEdgeGroups(prep, labels) {
     todo = left;
   }
   return dissolve.size;
+}
+
+// 同一種顏色、但在作品上分開的區塊，各自變成一種線（例如花邊、花心、內圈雖然都是白色）。
+// 每種線裡最大的一塊保留原本的編號，其他夠大的（超過整張圖 minFrac）各自給新編號；太小的碎塊留在原本的線。
+// 回傳新建立的編號
+// reserved：畫面上還在用的編號（不能拿來當新編號）
+export function splitRegions(labels, w, h, reserved = [], minFrac = 0.0015) {
+  const n = w * h;
+  const used = new Set([...labels, ...reserved]);
+  const free = [];
+  for (let i = 0; i < 255; i++) if (!used.has(i)) free.push(i);
+  const comps = new Map(); // 編號 → [{ members }]
+  const seen = new Uint8Array(n);
+  const stack = [];
+  for (let s0 = 0; s0 < n; s0++) {
+    const v = labels[s0];
+    if (seen[s0] || v === BG) continue;
+    const members = [];
+    seen[s0] = 1;
+    stack.push(s0);
+    while (stack.length) {
+      const i = stack.pop();
+      members.push(i);
+      const x = i % w;
+      for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+        if (j < 0 || j >= n || seen[j] || labels[j] !== v) continue;
+        seen[j] = 1;
+        stack.push(j);
+      }
+    }
+    if (members.length < n * minFrac) continue;
+    if (!comps.has(v)) comps.set(v, []);
+    for (const part of splitAtNecks(members, w, h)) comps.get(v).push(part);
+  }
+  const made = [];
+  for (const list of comps.values()) {
+    list.sort((a, b) => b.length - a.length);
+    for (let k = 1; k < list.length && free.length; k++) {
+      const id = free.shift();
+      for (const i of list[k]) labels[i] = id;
+      made.push(id);
+    }
+  }
+  return made;
+}
+
+// 兩大塊只靠一小段連在一起（例如花邊和內圈在兩端接起來）：把這塊往內縮，看會不會斷成兩大塊（各超過整張圖 1.5%），
+// 會的話以斷開的兩大塊為中心，各自往外長回原本的範圍。鏤空花邊縮了會碎成很多小塊，小塊不算，所以不會被切碎
+function splitAtNecks(members, w, h) {
+  const n = w * h;
+  if (members.length < n * 0.03) return [members];
+  const k = Math.max(4, Math.round(Math.max(w, h) * 0.012));
+  const ind = new Float32Array(n);
+  for (const i of members) ind[i] = 1;
+  const core = boxBlur(ind, w, h, k);
+  const owner = new Int32Array(n).fill(-1);
+  const seeds = [];
+  let id = 0;
+  const stack = [];
+  for (const s0 of members) {
+    if (core[s0] < 0.999 || owner[s0] !== -1) continue;
+    const part = [];
+    owner[s0] = -2;
+    stack.push(s0);
+    while (stack.length) {
+      const i = stack.pop();
+      part.push(i);
+      const x = i % w;
+      for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+        if (j < 0 || j >= n || owner[j] !== -1 || core[j] < 0.999) continue;
+        owner[j] = -2;
+        stack.push(j);
+      }
+    }
+    if (part.length >= n * 0.015) { for (const i of part) owner[i] = id; seeds.push(part); id++; }
+    else for (const i of part) owner[i] = -3;
+  }
+  if (seeds.length < 2) return [members];
+  // 從各個大塊同時往外長（只在原本的範圍內）
+  for (const i of members) if (owner[i] < 0) owner[i] = -1;
+  let front = seeds.flat();
+  while (front.length) {
+    const next = [];
+    for (const i of front) {
+      const x = i % w;
+      for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+        if (j < 0 || j >= n || !ind[j] || owner[j] !== -1) continue;
+        owner[j] = owner[i];
+        next.push(j);
+      }
+    }
+    front = next;
+  }
+  const parts = seeds.map(() => []);
+  for (const i of members) if (owner[i] >= 0) parts[owner[i]].push(i);
+  return parts;
 }
