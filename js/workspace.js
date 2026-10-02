@@ -93,6 +93,14 @@ export function createWorkspace(app) {
       S.groups.forEach((g, i) => (g.n = i + 1));
     }
     S.positions = Seg.labelPositions(S.labels, S.w, S.h, S.groups.map((g) => g.id));
+    // 哪一種線佔了圖片四周的一大半：很可能是背景（桌面、地板）
+    const border = new Map();
+    let total = 0;
+    const add = (i) => { const l = S.labels[i]; border.set(l, (border.get(l) || 0) + 1); total++; };
+    for (let x = 0; x < S.w; x++) { add(x); add((S.h - 1) * S.w + x); }
+    for (let y = 1; y < S.h - 1; y++) { add(y * S.w); add(y * S.w + S.w - 1); }
+    S.bgSuspect = null;
+    for (const g of S.groups) if ((border.get(g.id) || 0) / total > 0.6) S.bgSuspect = g.id;
     if (S.selected !== null && S.selected !== BG && !groupById(S.selected)) S.selected = null;
   }
 
@@ -551,8 +559,19 @@ export function createWorkspace(app) {
     smart.addEventListener('change', () => { S.brush.smart = smart.checked; renderPanel(); });
     const target = selGroup ? `${selGroup.n} 號線` : sel === BG ? '背景' : '未選';
 
+    const suspect = S.bgSuspect != null ? groupById(S.bgSuspect) : null;
+    const bgNotice = suspect
+      ? h('div', { class: 'notice' },
+        h('p', {}, `${suspect.n} 號線佔滿了圖片四周，看起來是背景（桌面、地板）。背景如果換色，桌面也會一起變色。`),
+        h('p', { class: 'small' }, '如果作品裡有跟背景很像的白色部分（例如花邊），設成背景後再用「AI 圈選」把它選回來。'),
+        h('div', { class: 'row-actions' },
+          button(`把 ${suspect.n} 號設為背景（不換色）`, { kind: 'primary', id: 'btn-bg', onClick: () => { S.selected = suspect.id; deleteSelected(); } }),
+          button('不是背景', { kind: 'ghost', onClick: () => { S.bgIgnore = suspect.id; renderPanel(); } })
+        ))
+      : null;
     return h('div', { class: 'panel-body' },
       h('p', { class: 'lead' }, `找到 ${S.groups.length} 種線，圖上的數字是每種線的位置。辨識不對的話，在這裡修正。`),
+      S.bgIgnore === S.bgSuspect ? null : bgNotice,
       h('label', { class: 'field' },
         h('span', {}, '辨識敏感度'),
         sens,
