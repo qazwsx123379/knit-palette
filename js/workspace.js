@@ -643,7 +643,8 @@ export function createWorkspace(app) {
       : a.busy ? 'AI 圈選中…'
       : !a.points.length ? '點圖上你要選的東西（例如花邊）。'
       : !hasInclude ? '還沒有綠點。先切到「要這裡」，點你要選的東西。'
-      : '黃框裡亮的地方是選到的範圍。選太少：「要這裡」再點；選太多：「不要這裡」點多的地方。';
+      : a.points.length > 6 ? '點太多了，AI 會被互相矛盾的點搞混。建議按「清除重選」，只在要的東西上點 1–2 個綠點，再切換範圍大小。'
+      : '黃框裡亮的地方是選到的範圍。不對就先切換「範圍大小」；還是不對再補 1–2 個點。';
     const sizeNames = ['小', '中', '大'];
     const sizes = a.options.length > 1 && !a.busy
       ? h('div', { class: 'field' },
@@ -710,6 +711,77 @@ export function createWorkspace(app) {
     S.ai.options = [];
   }
 
+  // 整理 AI 給的範圍：保留含有綠點的連通區塊，補掉裡面的小洞
+  function cleanMask(mask, points) {
+    const w = S.w, h = S.h, n = w * h;
+    const comp = new Int32Array(n).fill(-1);
+    const keep = new Set();
+    const stack = [];
+    const label = (start, id, val) => {
+      comp[start] = id;
+      stack.push(start);
+      let size = 0, edge = false;
+      while (stack.length) {
+        const i = stack.pop();
+        size++;
+        const x = i % w;
+        if (x === 0 || x === w - 1 || i < w || i >= n - w) edge = true;
+        for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+          if (j < 0 || j >= n || comp[j] >= 0 || mask[j] !== val) continue;
+          comp[j] = id;
+          stack.push(j);
+        }
+      }
+      return { size, edge };
+    };
+    // 選到的區塊
+    let id = 0;
+    const sizes = [];
+    for (let i = 0; i < n; i++) if (mask[i] && comp[i] < 0) sizes[id] = label(i, id++, 1).size;
+    for (const p of points) {
+      if (!p.include) continue;
+      const i = p.y * w + p.x;
+      if (mask[i]) { keep.add(comp[i]); continue; }
+      // 綠點剛好在選取範圍外：找附近最大的一塊（不要撿到雜點）
+      let best = -1;
+      const R = Math.round(Math.max(w, h) * 0.06);
+      for (let dy = -R; dy <= R; dy += 2) for (let dx = -R; dx <= R; dx += 2) {
+        const x = p.x + dx, y = p.y + dy;
+        if (x < 0 || y < 0 || x >= w || y >= h) continue;
+        const j = y * w + x;
+        if (mask[j] && (best < 0 || sizes[comp[j]] > sizes[best])) best = comp[j];
+      }
+      if (best >= 0 && sizes[best] > n * 0.0005) keep.add(best);
+    }
+    // 都找不到：留最大的一塊
+    if (!keep.size && sizes.length) keep.add(sizes.indexOf(Math.max(...sizes)));
+    if (!keep.size) return mask;
+    const out = new Uint8Array(n);
+    for (let i = 0; i < n; i++) if (mask[i] && keep.has(comp[i])) out[i] = 1;
+    // 補洞：沒選到、又被選取範圍包住的小洞（小於整張圖 0.3%）
+    const hole = new Int32Array(n).fill(-1);
+    for (let i = 0; i < n; i++) {
+      if (out[i] || hole[i] >= 0) continue;
+      const members = [];
+      let edge = false;
+      hole[i] = 1;
+      stack.push(i);
+      while (stack.length) {
+        const k = stack.pop();
+        members.push(k);
+        const x = k % w;
+        if (x === 0 || x === w - 1 || k < w || k >= n - w) edge = true;
+        for (const j of [x > 0 ? k - 1 : -1, x < w - 1 ? k + 1 : -1, k - w, k + w]) {
+          if (j < 0 || j >= n || out[j] || hole[j] >= 0) continue;
+          hole[j] = 1;
+          stack.push(j);
+        }
+      }
+      if (!edge && members.length < n * 0.003) for (const k of members) out[k] = 1;
+    }
+    return out;
+  }
+
   // 連續點很快時，只算最新的那一次
   let aiRun = 0;
   async function runAi() {
@@ -726,8 +798,15 @@ export function createWorkspace(app) {
     renderPanel();
     renderCanvas();
     try {
-      const options = await selectByPoints(S.ai.handle, S.ai.points);
+      const raw = await selectByPoints(S.ai.handle, S.ai.points);
       if (my !== aiRun || session !== S) return;
+      // 只留下跟綠點連在一起的那一塊，散落的小點、小洞清掉
+      const options = raw.map((o) => {
+        const mask = cleanMask(o.mask, S.ai.points);
+        let area = 0;
+        for (let i = 0; i < mask.length; i++) area += mask[i];
+        return { ...o, mask, area: area / mask.length };
+      });
       // 預設用最小的範圍（AI 最有把握的常常是整件作品，太大）；使用者切換過大小，就沿用他選的
       const pick = Math.min(S.ai.size, options.length - 1);
       S.ai.options = options;
