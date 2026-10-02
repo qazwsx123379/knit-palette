@@ -415,3 +415,9 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .seg .dot.include { background: #22a559; }
 .seg .dot.exclude { background: #d33a3a; }
 .notice { display: grid; gap: 8px; padding: 12px; border-radius: 10px; background: var(--warm-soft); border: 1px solid color-mix(in srgb, var(--warm) 35%, transparent); }
+.notice.compact { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 8px 10px; font-size: .88rem; }
+.notice.compact > span { flex: 1 1 12em; }
+/* 右側面板太長時自己捲動，左邊的圖固定不動 */
+@media (min-width: 901px) {
+  .panel { max-height: calc(100vh - var(--topbar-h) - 32px); overflow-y: auto; }
+}

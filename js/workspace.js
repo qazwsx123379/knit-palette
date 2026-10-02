@@ -36,7 +36,7 @@ export function createWorkspace(app) {
       selected: null,
       brush: { on: false, size: 30, smart: true },
       wand: false,
-      ai: { on: false, handle: null, points: [], mask: null, options: [], pick: 0, include: true, busy: false },
+      ai: { on: false, handle: null, points: [], mask: null, options: [], pick: 0, size: 0, include: true, busy: false },
       tol: 14, // 智慧筆刷、魔術棒的顏色容許範圍
       showRegions: false,
       hold: false,
@@ -560,15 +560,28 @@ export function createWorkspace(app) {
     const target = selGroup ? `${selGroup.n} 號線` : sel === BG ? '背景' : '未選';
 
     const suspect = S.bgSuspect != null ? groupById(S.bgSuspect) : null;
-    const bgNotice = suspect
-      ? h('div', { class: 'notice' },
-        h('p', {}, `${suspect.n} 號線佔滿了圖片四周，看起來是背景（桌面、地板）。背景如果換色，桌面也會一起變色。`),
-        h('p', { class: 'small' }, '如果作品裡有跟背景很像的白色部分（例如花邊），設成背景後再用「AI 圈選」把它選回來。'),
-        h('div', { class: 'row-actions' },
-          button(`把 ${suspect.n} 號設為背景（不換色）`, { kind: 'primary', id: 'btn-bg', onClick: () => { S.selected = suspect.id; deleteSelected(); } }),
-          button('不是背景', { kind: 'ghost', onClick: () => { S.bgIgnore = suspect.id; renderPanel(); } })
-        ))
-      : null;
+    const toolOn = S.ai.on || S.brush.on || S.wand;
+    const bgNotice = suspect && !toolOn ? bgNoticeEl(suspect) : null;
+    // 用工具時，面板只留需要的東西，不用捲動就看得到「套用」
+    if (toolOn) {
+      const toolName = S.ai.on ? 'AI 圈選' : S.brush.on ? '筆刷' : '魔術棒';
+      return h('div', { class: 'panel-body' },
+        h('div', { class: 'field' }, h('span', {}, '選好的範圍要變成哪一種線'), chips),
+        S.ai.on ? aiBox(target) : h('div', { class: 'tool-box' },
+          h('p', { class: 'small' }, S.brush.on ? `在圖上塗，塗到的地方會變成：${target}` : `點圖上的一個地方，相連又相近的顏色會變成：${target}`),
+          S.brush.on ? h('label', { class: 'field' }, h('span', {}, '筆刷大小'), brushSize) : null,
+          S.brush.on ? h('label', { class: 'check' }, smart, h('span', {}, '只塗跟下筆處相近的顏色（智慧筆刷）')) : null,
+          S.wand || S.brush.smart
+            ? h('label', { class: 'field' }, h('span', {}, '顏色容許範圍'), tol, h('span', { class: 'range-labels' }, h('span', {}, '只選很像的'), h('span', {}, '範圍大一點')))
+            : null
+        ),
+        h('div', { class: 'tool-grid' },
+          button('復原', { icon: 'undo', onClick: undo, disabled: !S.undo.length }),
+          button(`關閉${toolName}`, { icon: 'close', id: S.ai.on ? 'btn-ai' : null, onClick: () => { if (S.ai.on) toggleAi(); else if (S.brush.on) toggleBrush(); else toggleWand(); } })
+        ),
+        button('辨識完成，開始配色', { kind: 'primary block', onClick: () => setMode('color') })
+      );
+    }
     return h('div', { class: 'panel-body' },
       h('p', { class: 'lead' }, `找到 ${S.groups.length} 種線，圖上的數字是每種線的位置。辨識不對的話，在這裡修正。`),
       S.bgIgnore === S.bgSuspect ? null : bgNotice,
@@ -615,19 +628,19 @@ export function createWorkspace(app) {
     const hasInclude = a.points.some((p) => p.include);
     const status = !a.handle ? '準備中…'
       : a.busy ? 'AI 圈選中…'
-      : !a.points.length ? '第 1 步：點圖上你要選的東西（例如白色花邊），會出現綠點。'
+      : !a.points.length ? '點圖上你要選的東西（例如花邊）。'
       : !hasInclude ? '還沒有綠點。先切到「要這裡」，點你要選的東西。'
-      : '圖上亮的地方（黃色外框裡）是 AI 選到的範圍，變暗的是沒選到的。選太少就用「要這裡」再點；選太多就用「不要這裡」點多出來的地方。';
+      : '黃框裡亮的地方是選到的範圍。選太少：「要這裡」再點；選太多：「不要這裡」點多的地方。';
     const sizeNames = ['小', '中', '大'];
     const sizes = a.options.length > 1 && !a.busy
       ? h('div', { class: 'field' },
-        h('span', {}, '選取範圍大小（選錯大小時切換看看）'),
+        h('span', {}, '範圍大小'),
         h('div', { class: 'seg', role: 'group', 'aria-label': '選取範圍大小' },
           a.options.map((o, i) => h('button', {
             type: 'button',
             class: i === a.pick ? 'on' : '',
             'aria-pressed': String(i === a.pick),
-            onclick: () => { a.pick = i; a.mask = o.mask; refresh(); },
+            onclick: () => { a.pick = i; a.size = i; a.mask = o.mask; refresh(); },
           }, `${sizeNames[i] || i + 1}（${Math.max(1, Math.round(o.area * 100))}%）`))
         ))
       : null;
@@ -696,10 +709,8 @@ export function createWorkspace(app) {
     try {
       const options = await selectByPoints(S.ai.handle, S.ai.points);
       if (my !== aiRun || session !== S) return;
-      // 只點一個點時，AI 最有把握的常常是「整件作品」，所以先給中等大小；點了好幾個點時才用最有把握的
-      let pick = 0;
-      if (S.ai.points.length === 1 && options.length >= 3) pick = 1;
-      else options.forEach((o, i) => { if (o.score > options[pick].score) pick = i; });
+      // 預設用最小的範圍（AI 最有把握的常常是整件作品，太大）；使用者切換過大小，就沿用他選的
+      const pick = Math.min(S.ai.size, options.length - 1);
       S.ai.options = options;
       S.ai.pick = pick;
       S.ai.mask = options.length ? options[pick].mask : null;
@@ -735,6 +746,28 @@ export function createWorkspace(app) {
     if (S.wand) { S.brush.on = false; stopAi(); }
     if (S.wand && S.selected === null) toast('先選要改成哪一種線，再點圖');
     refresh();
+  }
+
+  // 「這種線看起來是背景」的一行提示（調整辨識和配色都會出現）
+  function bgNoticeEl(suspect) {
+    return h('div', { class: 'notice compact' },
+      h('span', {}, `${suspect.n} 號線看起來是背景，換色會連桌面一起變。`),
+      button('設為背景', { kind: 'small primary', id: 'btn-bg', onClick: () => setBackground(suspect.id) }),
+      button('不是', { kind: 'small ghost', onClick: () => { S.bgIgnore = suspect.id; renderPanel(); } })
+    );
+  }
+
+  function setBackground(id) {
+    const g = groupById(id);
+    if (!g) return;
+    pushUndo();
+    for (let i = 0; i < S.labels.length; i++) if (S.labels[i] === id) S.labels[i] = BG;
+    S.manual = true;
+    if (S.selected === id) S.selected = null;
+    recompute({ renumber: S.mode === 'detect' });
+    markDirty();
+    refresh();
+    toast(`已把 ${g.n} 號設為背景（不換色）。可以按「復原」`);
   }
 
   function toggleBrush() {
@@ -839,8 +872,10 @@ export function createWorkspace(app) {
     ['pointerup', 'pointerleave', 'pointercancel'].forEach((ev) => hold.addEventListener(ev, () => setHold(false)));
     hold.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') setHold(true); });
     hold.addEventListener('keyup', () => setHold(false));
+    const suspect = S.bgSuspect != null && S.bgIgnore !== S.bgSuspect ? groupById(S.bgSuspect) : null;
     return h('div', { class: 'panel-body' },
       h('p', { class: 'lead' }, '點圖上的數字或下面的清單，幫每種線挑顏色。'),
+      suspect ? bgNoticeEl(suspect) : null,
       list,
       hold,
       h('div', { class: 'tool-grid' },

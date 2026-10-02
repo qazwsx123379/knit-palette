@@ -83,7 +83,9 @@ export function recolor(prep, labels, targets, out) {
     if (!c) continue;
     const sd = Math.sqrt(Math.max(0, s2 / c - (s / c) ** 2));
     const [tL, ta, tb] = hexToLab(t.hex);
-    const k = Math.max(0.6, Math.min(2.5, naturalTexture(tL) / Math.max(1.2, sd)));
+    let k = Math.max(0.6, Math.min(2.2, naturalTexture(tL) / Math.max(1.2, sd)));
+    // 幾乎沒有紋理的地方（背景、平滑的布）不要放大，不然會把照片雜訊放大成斑紋
+    if (sd < 2.2) k = Math.min(k, 1.1);
     plan[id] = { tL, ta, tb, mean: sum / c, sa: t.srcLab[1], sb: t.srcLab[2], k };
     local[id] = lm;
   }
