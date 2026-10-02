@@ -57,8 +57,11 @@ export function recolor(prep, labels, targets, out) {
     // 越暗的地方彩度稍微低一點，看起來比較自然；保留一點原本的色偏變化
     let cs = 0.8 + 0.2 * (L2 / Math.max(p.tL, 1));
     if (cs > 1.1) cs = 1.1;
-    const a2 = p.ta * cs + (a - p.sa) * 0.25;
-    const b2 = p.tb * cs + (b - p.sb) * 0.25;
+    // 原本的色偏只留一點點，而且有上限：不然原本是橘色的地方換成白色後會帶著橘色
+    const da = Math.max(-4, Math.min(4, (a - p.sa) * 0.2));
+    const db = Math.max(-4, Math.min(4, (b - p.sb) * 0.2));
+    const a2 = p.ta * cs + da;
+    const b2 = p.tb * cs + db;
     const [r, g, bb] = labToRgb(L2, a2, b2);
     dst[o] = r; dst[o + 1] = g; dst[o + 2] = bb; dst[o + 3] = 255;
   }

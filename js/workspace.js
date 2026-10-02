@@ -36,7 +36,7 @@ export function createWorkspace(app) {
       selected: null,
       brush: { on: false, size: 30, smart: true },
       wand: false,
-      ai: { on: false, handle: null, points: [], mask: null, include: true, busy: false },
+      ai: { on: false, handle: null, points: [], mask: null, options: [], pick: 0, include: true, busy: false },
       tol: 14, // 智慧筆刷、魔術棒的顏色容許範圍
       showRegions: false,
       hold: false,
@@ -586,12 +586,26 @@ export function createWorkspace(app) {
       h('button', { type: 'button', class: !a.include ? 'on' : '', 'aria-pressed': String(!a.include), onclick: () => { a.include = false; renderPanel(); } }, '排除範圍')
     );
     const status = !a.handle ? '準備中…' : a.busy ? 'AI 圈選中…' : a.points.length ? `已點 ${a.points.length} 個點。範圍不對就再點：選太少用「加入範圍」、選太多用「排除範圍」。` : '點圖上你要選的東西，例如花邊或絨球。';
+    const sizeNames = ['小', '中', '大'];
+    const sizes = a.options.length > 1 && !a.busy
+      ? h('div', { class: 'field' },
+        h('span', {}, '選取範圍大小（選錯大小時切換看看）'),
+        h('div', { class: 'seg', role: 'group', 'aria-label': '選取範圍大小' },
+          a.options.map((o, i) => h('button', {
+            type: 'button',
+            class: i === a.pick ? 'on' : '',
+            'aria-pressed': String(i === a.pick),
+            onclick: () => { a.pick = i; a.mask = o.mask; refresh(); },
+          }, `${sizeNames[i] || i + 1}（${Math.max(1, Math.round(o.area * 100))}%）`))
+        ))
+      : null;
     return h('div', { class: 'tool-box' },
       h('p', { class: 'small', id: 'ai-status' }, status),
       seg,
+      sizes,
       h('div', { class: 'row-actions' },
         button(`套用到：${target}`, { kind: 'primary', onClick: applyAi, disabled: !a.mask || a.busy || S.selected === null, id: 'btn-ai-apply' }),
-        button('清除重選', { kind: 'ghost', onClick: () => { a.points = []; a.mask = null; refresh(); }, disabled: !a.points.length })
+        button('清除重選', { kind: 'ghost', onClick: () => { a.points = []; a.mask = null; a.options = []; refresh(); }, disabled: !a.points.length })
       ),
       S.selected === null ? h('p', { class: 'small' }, '先在上面「選一種線」，選好的範圍會變成那一種線。') : null
     );
@@ -629,6 +643,7 @@ export function createWorkspace(app) {
     S.ai.on = false;
     S.ai.points = [];
     S.ai.mask = null;
+    S.ai.options = [];
   }
 
   // 連續點很快時，只算最新的那一次
@@ -640,9 +655,15 @@ export function createWorkspace(app) {
     renderPanel();
     renderCanvas();
     try {
-      const mask = await selectByPoints(S.ai.handle, S.ai.points);
+      const options = await selectByPoints(S.ai.handle, S.ai.points);
       if (my !== aiRun || session !== S) return;
-      S.ai.mask = mask;
+      // 只點一個點時，AI 最有把握的常常是「整件作品」，所以先給中等大小；點了好幾個點時才用最有把握的
+      let pick = 0;
+      if (S.ai.points.length === 1 && options.length >= 3) pick = 1;
+      else options.forEach((o, i) => { if (o.score > options[pick].score) pick = i; });
+      S.ai.options = options;
+      S.ai.pick = pick;
+      S.ai.mask = options.length ? options[pick].mask : null;
     } catch (e) {
       if (my === aiRun) toast(e.message || 'AI 圈選失敗', 'error');
     } finally {
@@ -661,6 +682,7 @@ export function createWorkspace(app) {
     for (let i = 0; i < mask.length; i++) if (mask[i]) { S.labels[i] = S.selected; n++; }
     S.ai.points = [];
     S.ai.mask = null;
+    S.ai.options = [];
     S.manual = true;
     recompute({ keep: S.selected });
     markDirty();
@@ -767,7 +789,7 @@ export function createWorkspace(app) {
           ),
           y && y.live ? h('span', { class: `chip ${y.owned ? 'ok' : ''}` }, y.owned ? '已有' : '需要買') : null
         ),
-        y ? h('button', { class: 'icon-btn', type: 'button', title: '改回原色', 'aria-label': `${g.n} 號線改回原色`, onclick: () => { g.yarn = null; markDirty(); refresh(); } }, icon('close')) : null
+        y ? h('button', { class: 'icon-btn', type: 'button', title: '改回原色', 'aria-label': `${g.n} 號線改回原色`, onclick: () => { pushUndo(); g.yarn = null; markDirty(); refresh(); } }, icon('close')) : null
       );
       list.append(row);
     }
@@ -780,7 +802,11 @@ export function createWorkspace(app) {
     return h('div', { class: 'panel-body' },
       h('p', { class: 'lead' }, '點圖上的數字或下面的清單，幫每種線挑顏色。'),
       list,
-      hold
+      hold,
+      h('div', { class: 'tool-grid' },
+        button('復原', { icon: 'undo', onClick: undo, disabled: !S.undo.length, id: 'btn-undo-color' }),
+        button('回去修改範圍', { icon: 'brush', onClick: () => setMode('detect'), title: '回到「1 調整辨識」，重新圈選或修改每種線的範圍' })
+      )
     );
   }
 
@@ -797,6 +823,7 @@ export function createWorkspace(app) {
       currentId: g.yarn ? g.yarn.id : null,
       onPick: (picked) => {
         const brand = data.brand(picked.brandId);
+        pushUndo();
         g.yarn = { id: picked.id, brandId: picked.brandId, brandName: brand ? brand.name : '', code: picked.code, name: picked.name, hex: picked.hex };
         markDirty();
         refresh();

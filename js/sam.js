@@ -52,7 +52,9 @@ export async function analyzeImage(canvas) {
   return { inputs, embeddings, w: canvas.width, h: canvas.height };
 }
 
-// points: [{ x, y, include }]，座標是作品圖上的像素。回傳每個像素是否被選到（1/0）
+// points: [{ x, y, include }]，座標是作品圖上的像素。
+// AI 每次會給三種大小的選法（例如：一個針目、一片花邊、整件作品），全部回傳，由小到大排列：
+// [{ mask: 每個像素是否被選到（1/0）, score: AI 的把握程度, area: 佔整張圖的比例 }]
 export async function selectByPoints(handle, points) {
   const { T, model, processor } = await loadSam();
   const [rh, rw] = handle.inputs.reshaped_input_sizes[0];
@@ -61,11 +63,16 @@ export async function selectByPoints(handle, points) {
   const input_labels = new T.Tensor('int64', BigInt64Array.from(points.map((p) => BigInt(p.include ? 1 : 0))), [1, 1, points.length]);
   const out = await model({ ...handle.embeddings, input_points, input_labels });
   const masks = await processor.post_process_masks(out.pred_masks, handle.inputs.original_sizes, handle.inputs.reshaped_input_sizes);
-  // AI 會給三種大小的選法，挑它最有把握的那個
   const scores = out.iou_scores.data;
-  let best = 0;
-  for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
   const n = handle.w * handle.h;
   const data = masks[0].data;
-  return data.length >= (best + 1) * n ? Uint8Array.from(data.subarray(best * n, (best + 1) * n)) : Uint8Array.from(data.subarray(0, n));
+  const count = Math.min(scores.length, Math.floor(data.length / n));
+  const options = [];
+  for (let k = 0; k < count; k++) {
+    const mask = Uint8Array.from(data.subarray(k * n, (k + 1) * n));
+    let area = 0;
+    for (let i = 0; i < n; i++) area += mask[i];
+    options.push({ mask, score: scores[k], area: area / n });
+  }
+  return options.sort((a, b) => a.area - b.area);
 }
