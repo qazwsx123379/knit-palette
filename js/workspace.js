@@ -273,7 +273,7 @@ export function createWorkspace(app) {
 
   function renderCanvas() {
     if (!S || !ctx) return;
-    const showRegions = S.mode === 'detect' && (S.showRegions || S.brush.on || S.wand || S.ai.on);
+    const showRegions = S.mode === 'detect' && !S.ai.on && (S.showRegions || S.brush.on || S.wand);
     if (showRegions) {
       const colors = {};
       for (const g of S.groups) colors[g.id] = hexToRgb(regionColor(g));
@@ -287,25 +287,31 @@ export function createWorkspace(app) {
     if (S.mode === 'detect' && S.ai.on) drawAiOverlay();
   }
 
-  // AI 圈選的預覽：選到的範圍蓋一層半透明，點過的地方畫圓點（綠色加入、紅色排除）
+  // AI 圈選的預覽：在原本的照片上，選到的地方保持明亮，沒選到的地方變暗，外框用亮黃色描出來
+  // 點過的地方畫圓點（綠色＝要的、紅色＝不要的）
   function drawAiOverlay() {
     const { mask, points } = S.ai;
     if (mask) {
       const ov = ctx.getImageData(0, 0, S.w, S.h);
       const d = ov.data;
       for (let i = 0; i < mask.length; i++) {
-        if (!mask[i]) continue;
+        if (mask[i]) continue;
         const o = i * 4;
-        d[o] = d[o] * 0.45 + 255 * 0.55;
-        d[o + 1] = d[o + 1] * 0.45 + 60 * 0.55;
-        d[o + 2] = d[o + 2] * 0.45 + 170 * 0.55;
+        d[o] *= 0.28; d[o + 1] *= 0.28; d[o + 2] *= 0.32;
       }
-      // 選取範圍的外框
+      // 外框：粗一點（2 像素）比較看得清楚
+      const edge = new Uint8Array(mask.length);
       for (let y = 1; y < S.h - 1; y++) {
         for (let x = 1; x < S.w - 1; x++) {
           const i = y * S.w + x;
-          if (mask[i] && (!mask[i - 1] || !mask[i + 1] || !mask[i - S.w] || !mask[i + S.w])) {
-            d[i * 4] = 255; d[i * 4 + 1] = 255; d[i * 4 + 2] = 255;
+          if (mask[i] && (!mask[i - 1] || !mask[i + 1] || !mask[i - S.w] || !mask[i + S.w])) edge[i] = 1;
+        }
+      }
+      for (let y = 1; y < S.h - 1; y++) {
+        for (let x = 1; x < S.w - 1; x++) {
+          const i = y * S.w + x;
+          if (edge[i] || edge[i - 1] || edge[i + 1] || edge[i - S.w] || edge[i + S.w]) {
+            d[i * 4] = 255; d[i * 4 + 1] = 214; d[i * 4 + 2] = 10;
           }
         }
       }
@@ -332,7 +338,9 @@ export function createWorkspace(app) {
 
   function renderBadges() {
     badgesEl.replaceChildren();
-    badgesEl.classList.toggle('passive', (S.brush.on || S.wand || S.ai.on) && S.mode === 'detect');
+    badgesEl.classList.toggle('passive', (S.brush.on || S.wand) && S.mode === 'detect');
+    // AI 圈選時把數字藏起來，才看得清楚選到哪裡
+    badgesEl.hidden = S.ai.on && S.mode === 'detect';
     // 數字互相重疊時，只留每種線的第一個，其餘的不顯示
     const rect = canvas.getBoundingClientRect();
     const placed = [];
@@ -504,7 +512,7 @@ export function createWorkspace(app) {
   function groupChip(g, { onClick, selected }) {
     return h('button', { type: 'button', class: `gchip ${selected ? 'on' : ''}`, 'aria-pressed': String(!!selected), onclick: onClick },
       h('span', { class: 'gnum' }, g.n),
-      h('span', { class: 'gdot', style: { background: S.showRegions || S.brush.on || S.wand || S.ai.on ? regionColor(g) : srcHex(g) } })
+      h('span', { class: 'gdot', style: { background: S.showRegions || S.brush.on || S.wand ? regionColor(g) : srcHex(g) } })
     );
   }
 
@@ -582,10 +590,15 @@ export function createWorkspace(app) {
   function aiBox(target) {
     const a = S.ai;
     const seg = h('div', { class: 'seg', role: 'group', 'aria-label': '點選方式' },
-      h('button', { type: 'button', class: a.include ? 'on' : '', 'aria-pressed': String(a.include), onclick: () => { a.include = true; renderPanel(); } }, '加入範圍'),
-      h('button', { type: 'button', class: !a.include ? 'on' : '', 'aria-pressed': String(!a.include), onclick: () => { a.include = false; renderPanel(); } }, '排除範圍')
+      h('button', { type: 'button', class: a.include ? 'on' : '', 'aria-pressed': String(a.include), onclick: () => { a.include = true; renderPanel(); } }, h('span', { class: 'dot include' }), '要這裡'),
+      h('button', { type: 'button', class: !a.include ? 'on' : '', 'aria-pressed': String(!a.include), onclick: () => { a.include = false; renderPanel(); } }, h('span', { class: 'dot exclude' }), '不要這裡')
     );
-    const status = !a.handle ? '準備中…' : a.busy ? 'AI 圈選中…' : a.points.length ? `已點 ${a.points.length} 個點。範圍不對就再點：選太少用「加入範圍」、選太多用「排除範圍」。` : '點圖上你要選的東西，例如花邊或絨球。';
+    const hasInclude = a.points.some((p) => p.include);
+    const status = !a.handle ? '準備中…'
+      : a.busy ? 'AI 圈選中…'
+      : !a.points.length ? '第 1 步：點圖上你要選的東西（例如白色花邊），會出現綠點。'
+      : !hasInclude ? '還沒有綠點。先切到「要這裡」，點你要選的東西。'
+      : '圖上亮的地方（黃色外框裡）是 AI 選到的範圍，變暗的是沒選到的。選太少就用「要這裡」再點；選太多就用「不要這裡」點多出來的地方。';
     const sizeNames = ['小', '中', '大'];
     const sizes = a.options.length > 1 && !a.busy
       ? h('div', { class: 'field' },
@@ -605,7 +618,7 @@ export function createWorkspace(app) {
       sizes,
       h('div', { class: 'row-actions' },
         button(`套用到：${target}`, { kind: 'primary', onClick: applyAi, disabled: !a.mask || a.busy || S.selected === null, id: 'btn-ai-apply' }),
-        button('清除重選', { kind: 'ghost', onClick: () => { a.points = []; a.mask = null; a.options = []; refresh(); }, disabled: !a.points.length })
+        button('清除重選', { kind: 'ghost', onClick: () => { a.points = []; a.mask = null; a.options = []; a.include = true; refresh(); }, disabled: !a.points.length })
       ),
       S.selected === null ? h('p', { class: 'small' }, '先在上面「選一種線」，選好的範圍會變成那一種線。') : null
     );
@@ -649,6 +662,13 @@ export function createWorkspace(app) {
   // 連續點很快時，只算最新的那一次
   let aiRun = 0;
   async function runAi() {
+    if (!S.ai.points.some((p) => p.include)) {
+      S.ai.mask = null;
+      S.ai.options = [];
+      refresh();
+      toast('先用「加入範圍」點一下你要選的東西（綠點），再用紅點排除多選的地方');
+      return;
+    }
     const my = ++aiRun;
     const session = S;
     S.ai.busy = true;
@@ -683,6 +703,7 @@ export function createWorkspace(app) {
     S.ai.points = [];
     S.ai.mask = null;
     S.ai.options = [];
+    S.ai.include = true;
     S.manual = true;
     recompute({ keep: S.selected });
     markDirty();
