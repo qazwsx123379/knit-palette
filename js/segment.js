@@ -365,39 +365,68 @@ export function fillHoles(labels, w, h, value, passes = 3) {
 
 // 自動分開背景：同一種顏色裡，「平滑又大片」的是背景（桌面、地板），「有針目紋理」的是毛線
 // 白色作品放在淺色桌面上時，兩者顏色一樣，只能靠紋理分開
+// 紋理用「各個方向都有起伏」來看：木紋、布紋只往一個方向有條紋（順著紋路看是平的），
+// 毛線針目是一顆一顆的，往哪個方向看都有起伏
 // 回傳變成背景的像素數
-const TEX_SMOOTH = 0.22; // 細紋理平均起伏小於這個值算平滑（項圈照片量過：背景、陰影 0.0–0.2，毛線 0.3 以上）
+// 平滑門檻跟著背景本身的紋理調整：取圖片四周（大多是背景）起伏的中位數 × 2.7，限制在 0.3–1.0
+// 量過：光滑桌面中位數 0.02（白色毛線 0.5 以上 → 門檻 0.3）；木紋桌面中位數 0.33、最多 0.75（毛線 1 以上 → 門檻 0.9）
+const ISO_K = 2.7, ISO_MIN = 0.3, ISO_MAX = 1.0;
+
+// 方框模糊（半徑 r）
+function boxBlur(src, w, h, r) {
+  const n = w * h, tmp = new Float32Array(n), out = new Float32Array(n), k = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    let a = 0;
+    for (let x = -r; x <= r; x++) a += src[y * w + Math.min(w - 1, Math.max(0, x))];
+    for (let x = 0; x < w; x++) { tmp[y * w + x] = a / k; a += src[y * w + Math.min(w - 1, x + r + 1)] - src[y * w + Math.max(0, x - r)]; }
+  }
+  for (let x = 0; x < w; x++) {
+    let a = 0;
+    for (let y = -r; y <= r; y++) a += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
+    for (let y = 0; y < h; y++) { out[y * w + x] = a / k; a += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x]; }
+  }
+  return out;
+}
+
+// 四個方向（橫、直、兩個斜向）的亮度變化，各自在半徑 rr 內平均，取最小的那個方向
+function isoTexture(L, w, h, rr) {
+  const n = w * h;
+  const b = boxBlur(L, w, h, 1);
+  const d = [0, 1, 2, 3].map(() => new Float32Array(n));
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      d[0][i] = Math.abs(b[i + 1] - b[i - 1]);
+      d[1][i] = Math.abs(b[i + w] - b[i - w]);
+      d[2][i] = Math.abs(b[i + w + 1] - b[i - w - 1]) * 0.707;
+      d[3][i] = Math.abs(b[i + w - 1] - b[i - w + 1]) * 0.707;
+    }
+  }
+  const m = d.map((a) => boxBlur(a, w, h, rr));
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = Math.min(m[0][i], m[1][i], m[2][i], m[3][i]);
+  return out;
+}
 
 export function separateBackground(prep, labels, id) {
   const { w, h, n, lab } = prep;
   const r = Math.max(3, Math.round(Math.max(w, h) * 0.006));
-  // 每個像素附近的亮度起伏（紋理強弱）
   const L = new Float32Array(n);
   for (let i = 0; i < n; i++) L[i] = lab[i * 3];
-  const blur = (src) => blurR(src, r);
-  // 方框模糊（半徑 rr）
-  function blurR(src, rr) {
-    const r = rr;
-    const tmp = new Float32Array(n), out = new Float32Array(n), k = 2 * r + 1;
-    for (let y = 0; y < h; y++) {
-      let a = 0;
-      for (let x = -r; x <= r; x++) a += src[y * w + Math.min(w - 1, Math.max(0, x))];
-      for (let x = 0; x < w; x++) { tmp[y * w + x] = a / k; a += src[y * w + Math.min(w - 1, x + r + 1)] - src[y * w + Math.max(0, x - r)]; }
-    }
+  const tex = isoTexture(L, w, h, r * 2);
+  const edge = Math.round(Math.min(w, h) * 0.04);
+  const border = [];
+  for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      let a = 0;
-      for (let y = -r; y <= r; y++) a += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
-      for (let y = 0; y < h; y++) { out[y * w + x] = a / k; a += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x]; }
+      const i = y * w + x;
+      if (labels[i] === id && (x < edge || y < edge || x >= w - edge || y >= h - edge)) border.push(tex[i]);
     }
-    return out;
   }
-  // 只看細小的起伏（針目），陰影這種慢慢變暗的漸層不算紋理
-  const fine = blurR(L, 2);
-  const hp = new Float32Array(n);
-  for (let i = 0; i < n; i++) hp[i] = Math.abs(L[i] - fine[i]);
-  const tex = blur(hp);
+  if (!border.length) return 0;
+  const sorted = Float32Array.from(border).sort();
+  const T = Math.max(ISO_MIN, Math.min(ISO_MAX, sorted[sorted.length >> 1] * ISO_K));
   const smooth = new Uint8Array(n);
-  for (let i = 0; i < n; i++) if (labels[i] === id && tex[i] < TEX_SMOOTH) smooth[i] = 1;
+  for (let i = 0; i < n; i++) if (labels[i] === id && tex[i] < T) smooth[i] = 1;
   // 平滑的連成一大片（超過整張圖 0.05%）才算背景；毛線上零星的平滑小點不算
   const minArea = n * 0.0005;
   const comp = new Int32Array(n).fill(-1);
@@ -420,20 +449,11 @@ export function separateBackground(prep, labels, id) {
     }
     if (members.length >= minArea) for (const i of members) bg[i] = 1;
   }
-  // 背景的平均顏色
-  const sumB = [0, 0, 0];
   let nb = 0;
-  for (let i = 0; i < n; i++) {
-    if (labels[i] !== id || !bg[i]) continue;
-    sumB[0] += lab[i * 3]; sumB[1] += lab[i * 3 + 1]; sumB[2] += lab[i * 3 + 2];
-    nb++;
-  }
+  for (let i = 0; i < n; i++) if (bg[i]) nb++;
   if (!nb) return 0;
-  const cb = sumB.map((v) => v / nb);
-  // 交界附近（紋理是看一個範圍算的，會往外暈開幾個像素）：
-  // 用更小的範圍重新看紋理，平滑的算背景；一圈一圈往外推，碰到毛線就停
-  const tex2 = blurR(hp, 1);
-  const bgL = cb[0];
+  // 交界附近（紋理是看一個範圍算的，會往外暈開）：用小範圍重新看，平滑的算背景；一圈一圈往外推，碰到毛線就停
+  const tex2 = isoTexture(L, w, h, 2);
   for (let pass = 0; pass < r * 3; pass++) {
     const grow = [];
     for (let i = 0; i < n; i++) {
@@ -442,14 +462,10 @@ export function separateBackground(prep, labels, id) {
       if ((x > 0 && bg[i - 1]) || (x < w - 1 && bg[i + 1]) || (i >= w && bg[i - w]) || (i + w < n && bg[i + w])) grow.push(i);
     }
     let added = 0;
-    for (const i of grow) {
-      // 很平滑（陰影漸層也算），或是平滑又跟背景差不多亮
-      if (tex2[i] < TEX_SMOOTH * 1.2 || (tex2[i] < TEX_SMOOTH * 1.8 && Math.abs(lab[i * 3] - bgL) < 4)) { bg[i] = 1; added++; }
-    }
+    for (const i of grow) if (tex2[i] < T * 1.15) { bg[i] = 1; added++; }
     if (!added) break;
   }
   // 剩下的「毛線」裡，靠近圖片邊緣又很小塊的（浮水印、雜點）也算背景；作品中間的小點（裝飾針）保留
-  const edge = Math.round(Math.min(w, h) * 0.04);
   const seen = new Uint8Array(n);
   for (let s0 = 0; s0 < n; s0++) {
     if (seen[s0] || bg[s0] || labels[s0] !== id) continue;
