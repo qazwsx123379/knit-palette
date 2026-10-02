@@ -3,7 +3,7 @@ import { h, button, toast, confirmDialog } from './ui.js';
 import { GitHubStore } from './github.js';
 
 // 每次發布新版都要改，方便確認手機、電腦上用的是不是最新版
-export const APP_VERSION = '2026-10-03 第 17 版';
+export const APP_VERSION = '2026-10-03 第 18 版';
 
 const KEY = 'knit-github';
 

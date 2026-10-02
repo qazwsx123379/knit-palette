@@ -413,6 +413,10 @@ export function separateBackground(prep, labels, id) {
   const r = Math.max(3, Math.round(Math.max(w, h) * 0.006));
   const L = new Float32Array(n);
   for (let i = 0; i < n; i++) L[i] = lab[i * 3];
+  // 照片一邊比較暗（光從另一邊來）時，暗處的針目起伏也會跟著變小，會被誤認成平滑的桌面。
+  // 所以先把亮度除以附近的平均亮度，看「相對」的起伏
+  const Lm = boxBlur(L, w, h, r * 4);
+  for (let i = 0; i < n; i++) L[i] = (L[i] * 70) / Math.max(15, Lm[i]);
   const tex = isoTexture(L, w, h, r * 2);
   const edge = Math.round(Math.min(w, h) * 0.04);
   const border = [];
@@ -452,19 +456,61 @@ export function separateBackground(prep, labels, id) {
   let nb = 0;
   for (let i = 0; i < n; i++) if (bg[i]) nb++;
   if (!nb) return 0;
-  // 交界附近（紋理是看一個範圍算的，會往外暈開）：用小範圍重新看，平滑的算背景；一圈一圈往外推，碰到毛線就停
-  const tex2 = isoTexture(L, w, h, 2);
-  for (let pass = 0; pass < r * 3; pass++) {
-    const grow = [];
-    for (let i = 0; i < n; i++) {
-      if (bg[i] || labels[i] !== id) continue;
-      const x = i % w;
-      if ((x > 0 && bg[i - 1]) || (x < w - 1 && bg[i + 1]) || (i >= w && bg[i - w]) || (i + w < n && bg[i + w])) grow.push(i);
-    }
-    let added = 0;
-    for (const i of grow) if (tex2[i] < T * 1.15) { bg[i] = 1; added++; }
-    if (!added) break;
+  // 交界要畫在哪裡：只靠紋理門檻不準（範圍大會留下一條桌面，範圍小會吃掉平滑的白色毛線）。
+  // 改用「分水嶺」：先標出確定是背景（上面找到的大片平滑）和確定是毛線（有針目紋理、往內縮一個針目寬，因為紋理會往外暈開約一個針目寬）的地方，
+  // 兩邊同時往外長，交界自然落在兩者之間亮暗變化最明顯的那條線（毛線的輪廓）
+  const texM = isoTexture(L, w, h, r);
+  // 「確定是毛線」用的紋理：先把很暗的地方（不到附近平均的 75%）墊高。作品貼桌面那條很暗的影子線
+  // 會讓旁邊的桌面也看起來有紋理；毛線本身的起伏主要在中間到亮的範圍，墊高影響不大
+  const Lc = new Float32Array(n);
+  for (let i = 0; i < n; i++) Lc[i] = Math.max(L[i], 52);
+  const texY = isoTexture(Lc, w, h, r);
+  const yarnInd = new Float32Array(n);
+  for (let i = 0; i < n; i++) yarnInd[i] = labels[i] !== id ? (labels[i] === BG ? 0 : 1) : texY[i] > T * 1.15 && !bg[i] ? 1 : 0;
+  const yarnCore = boxBlur(yarnInd, w, h, r);
+  const state = new Uint8Array(n); // 0 未定 1 背景 2 毛線
+  for (let i = 0; i < n; i++) {
+    if (labels[i] === BG || bg[i]) state[i] = 1;
+    else if (labels[i] !== id || yarnCore[i] > 0.999) state[i] = 2;
   }
+  // 亮暗變化（梯度）：用調整過亮度的 L，光線不均勻也一樣
+  const Lb = boxBlur(L, w, h, 1);
+  const grad = new Uint8Array(n);
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const gx = Lb[i + 1] - Lb[i - 1], gy = Lb[i + w] - Lb[i - w];
+      grad[i] = Math.min(255, Math.round(Math.hypot(gx, gy) * 6));
+    }
+  }
+  const buckets = Array.from({ length: 256 }, () => []);
+  const queued = new Uint8Array(n);
+  const pushN = (i) => {
+    const x = i % w;
+    for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+      if (j < 0 || j >= n || state[j] || queued[j]) continue;
+      queued[j] = state[i];
+      buckets[grad[j]].push(j);
+    }
+  };
+  for (let i = 0; i < n; i++) if (state[i] && labels[i] === id) pushN(i);
+  for (let i = 0; i < n; i++) if (state[i] && labels[i] !== id) pushN(i);
+  for (let lv = 0; lv < 256; lv++) {
+    const bk = buckets[lv];
+    while (bk.length) {
+      const i = bk.pop();
+      if (state[i]) continue;
+      state[i] = queued[i];
+      // 新加入的鄰居亮暗變化比目前低的，也排在目前這一層（水位不會下降）
+      const x = i % w;
+      for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+        if (j < 0 || j >= n || state[j] || queued[j]) continue;
+        queued[j] = state[i];
+        buckets[Math.max(lv, grad[j])].push(j);
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) if (labels[i] === id && state[i] === 1) bg[i] = 1;
   // 剩下的「毛線」裡，靠近圖片邊緣又很小塊的（浮水印、雜點）也算背景；作品中間的小點（裝飾針）保留
   const seen = new Uint8Array(n);
   for (let s0 = 0; s0 < n; s0++) {
@@ -488,41 +534,68 @@ export function separateBackground(prep, labels, id) {
   }
   let moved = 0;
   for (let i = 0; i < n; i++) if (bg[i] && labels[i] === id) { labels[i] = BG; moved++; }
-  removeShadows(prep, labels, tex2, T);
+  removeShadows(prep, labels, texM, T, id);
   return moved;
 }
 
 // 作品投在桌面上的影子：顏色跟背景同色系但比較暗、又平滑，常被分到毛線的群（灰影子併進藍線或杏色線），
 // 換色後會變成一圈假邊。從背景往外一圈一圈推，把這種像素也改成背景；最後把作品外面零星的小碎塊也清掉
-function removeShadows(prep, labels, tex2, T) {
+function removeShadows(prep, labels, texM, T, id) {
   const { w, h, n, lab } = prep;
-  const sum = [0, 0, 0];
+  const r = Math.max(3, Math.round(Math.max(w, h) * 0.006));
+  // 「附近」的背景顏色：照片光線不均勻（一邊比較暗）時，要跟旁邊的桌面比，不能跟整張圖的平均比，
+  // 否則暗的那一邊的毛線會被當成影子
+  const m = new Float32Array(n), cL = new Float32Array(n), ca = new Float32Array(n), cb = new Float32Array(n);
   let nb = 0;
   for (let i = 0; i < n; i++) {
     if (labels[i] !== BG) continue;
-    sum[0] += lab[i * 3]; sum[1] += lab[i * 3 + 1]; sum[2] += lab[i * 3 + 2];
+    m[i] = 1; cL[i] = lab[i * 3]; ca[i] = lab[i * 3 + 1]; cb[i] = lab[i * 3 + 2];
     nb++;
   }
   if (!nb) return;
-  const [bL, ba, bb] = sum.map((v) => v / nb);
+  const R = r * 10;
+  const bm = boxBlur(m, w, h, R), bL = boxBlur(cL, w, h, R), ba = boxBlur(ca, w, h, R), bb = boxBlur(cb, w, h, R);
   const isBg = (i) => labels[i] === BG;
-  const r = Math.max(3, Math.round(Math.max(w, h) * 0.006));
   for (let pass = 0; pass < r * 4; pass++) {
     const grow = [];
     for (let i = 0; i < n; i++) {
-      if (isBg(i)) continue;
+      if (isBg(i) || bm[i] < 0.02) continue;
       const x = i % w;
       if (!((x > 0 && isBg(i - 1)) || (x < w - 1 && isBg(i + 1)) || (i >= w && isBg(i - w)) || (i + w < n && isBg(i + w)))) continue;
-      const dL = bL - lab[i * 3];
-      const dab = Math.hypot(lab[i * 3 + 1] - ba, lab[i * 3 + 2] - bb);
+      const L0 = bL[i] / bm[i];
+      const dL = L0 - lab[i * 3];
+      const dab = Math.hypot(lab[i * 3 + 1] - ba[i] / bm[i], lab[i * 3 + 2] - bb[i] / bm[i]);
       const sameHue = dab < 6 + Math.max(0, dL) * 0.2;
-      // 平滑、比背景暗（或差不多亮）、色調跟背景接近
-      if (sameHue && dL > -3 && tex2[i] < T * 1.3) grow.push(i);
-      // 作品貼著桌面的那條深色影子：明顯比背景暗，兩側亮暗變化大所以紋理偏高，只往外推約一個針目寬
-      else if (sameHue && dL > 8 && tex2[i] < T * 2.5 && pass < r * 1.5) grow.push(i);
+      // 平滑、比旁邊的背景暗、色調跟背景接近（差不多亮的不算：白色毛線邊緣也是這樣，會被一路吃掉）
+      if (sameHue && dL > 4 && texM[i] < T * 1.1) grow.push(i);
     }
     for (const i of grow) labels[i] = BG;
     if (!grow.length) break;
+  }
+  // 影子靠著毛線的部分，紋理分不出來，改看亮度：離背景兩個針目寬以內、亮度不到旁邊桌面的 68%、色調相近的才算影子
+  // （量過：作品貼桌面的影子 51–64%、作品中間洞裡的影子 40–60%；背光的白色花邊 73% 以上）
+  // 影子和桌面之間常隔著一圈淡淡的半影，所以不要求一路連過去，只看離背景多遠
+  const dist = new Uint8Array(n).fill(255);
+  let front = [];
+  for (let i = 0; i < n; i++) if (isBg(i)) { dist[i] = 0; front.push(i); }
+  for (let d = 1; d <= r * 2 && front.length; d++) {
+    const next = [];
+    for (const i of front) {
+      const x = i % w;
+      for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+        if (j < 0 || j >= n || dist[j] !== 255) continue;
+        dist[j] = d;
+        next.push(j);
+      }
+    }
+    front = next;
+  }
+  for (let i = 0; i < n; i++) {
+    if (isBg(i) || dist[i] === 255 || bm[i] < 0.02) continue;
+    const L0 = bL[i] / bm[i];
+    const dL = L0 - lab[i * 3];
+    const dab = Math.hypot(lab[i * 3 + 1] - ba[i] / bm[i], lab[i * 3 + 2] - bb[i] / bm[i]);
+    if (dab < 6 + Math.max(0, dL) * 0.2 && lab[i * 3] < L0 * 0.68) labels[i] = BG;
   }
   // 作品外面零星的小碎塊（木紋上的亮點、影子邊）：不是背景的像素連成一塊，小於整張圖 0.2% 就算背景
   const seen = new Uint8Array(n);
@@ -545,6 +618,29 @@ function removeShadows(prep, labels, tex2, T) {
     if (members.length < n * 0.002) for (const i of members) labels[i] = BG;
   }
   removeThin(labels, w, h);
+  // 貼在作品邊上的小顆粒（同一種顏色的一小塊，周圍一半以上是背景；或是跟背景同一群、碰到背景的小塊）也算背景；被毛線包住的小裝飾不算
+  const seen2 = new Uint8Array(n);
+  for (let s0 = 0; s0 < n; s0++) {
+    if (seen2[s0] || isBg(s0)) continue;
+    const v = labels[s0];
+    const members = [];
+    let edgeBg = 0, edgeAll = 0;
+    seen2[s0] = 1;
+    stack.push(s0);
+    while (stack.length) {
+      const i = stack.pop();
+      members.push(i);
+      const x = i % w;
+      for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) {
+        if (j < 0 || j >= n) continue;
+        if (labels[j] !== v) { edgeAll++; if (isBg(j)) edgeBg++; continue; }
+        if (seen2[j]) continue;
+        seen2[j] = 1;
+        stack.push(j);
+      }
+    }
+    if (members.length < n * 0.001 && (edgeBg > edgeAll * 0.5 || (v === id && edgeBg > 0))) for (const i of members) labels[i] = BG;
+  }
 }
 
 // 兩種線交界、或線和背景交界常有 2–6 像素寬的細條被分到第三種線（例如藍線和杏色線之間的深色縫被當成白線），
@@ -707,4 +803,73 @@ export function decodeLabels(b64, n) {
     i += run;
   }
   return labels;
+}
+
+// 「陰影群」：光線、壓縮讓某種線的暗部、線和線之間的縫、影子被分成另一群。判斷方式：
+// (1) 這群多半是零碎的邊（7×7 範圍內自己這群不到 3/4 的像素超過一半），或
+// (2) 有點零碎（超過 1/4），而且「調亮之後」顏色跟旁邊某種較大的線一樣（暗杏色＝杏色線的陰影）。
+// 真的深色線（例如咖啡色）會自己連成一大片，不會被當成陰影。
+// 拆掉的群，每個像素交給附近「調亮後顏色最接近」的那種線。回傳拆掉幾群
+// 暗的顏色調亮到 L：a、b 跟著亮度等比例放大（最多 3 倍）
+function shadeDist(p, g) {
+  const k = Math.max(1, Math.min(3, g[0] / Math.max(p[0], 10)));
+  return Math.hypot((p[0] - g[0]) * 0.15, p[1] * k - g[1], p[2] * k - g[2]);
+}
+
+export function dissolveEdgeGroups(prep, labels) {
+  const { w, h, n, lab } = prep;
+  const ids = [...new Set(labels)].filter((v) => v !== BG);
+  if (ids.length < 2) return 0;
+  const ind = new Float32Array(n);
+  const stats = groupStats(prep, labels);
+  const dissolve = new Set();
+  for (const id of ids) {
+    const st = stats[id];
+    if (!st || st.count > n * 0.15) continue;
+    for (let i = 0; i < n; i++) ind[i] = labels[i] === id ? 1 : 0;
+    const frac = boxBlur(ind, w, h, 3);
+    let edge = 0;
+    for (let i = 0; i < n; i++) if (ind[i] && frac[i] < 0.75) edge++;
+    const ef = edge / st.count;
+    const shadeOf = ids.some((o) => o !== id && stats[o].count > st.count * 0.5 && stats[o].lab[0] > st.lab[0] + 8 && shadeDist(st.lab, stats[o].lab) < 10);
+    if (ef > 0.5 || (ef > 0.25 && shadeOf)) dissolve.add(id);
+  }
+  if (!dissolve.size || dissolve.size === ids.length) return 0;
+  const colorOf = (id) => stats[id] && stats[id].lab;
+  const RW = 5;
+  let todo = [];
+  for (let i = 0; i < n; i++) if (dissolve.has(labels[i])) todo.push(i);
+  const px = [0, 0, 0];
+  for (let pass = 0; pass < 20 && todo.length; pass++) {
+    const assign = [];
+    const left = [];
+    for (const i of todo) {
+      const x = i % w, y = (i / w) | 0;
+      const cnt = new Map();
+      for (let dy = -RW; dy <= RW; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= h) continue;
+        for (let dx = -RW; dx <= RW; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= w) continue;
+          const v = labels[yy * w + xx];
+          if (dissolve.has(v)) continue;
+          cnt.set(v, (cnt.get(v) || 0) + 1);
+        }
+      }
+      px[0] = lab[i * 3]; px[1] = lab[i * 3 + 1]; px[2] = lab[i * 3 + 2];
+      let best = -1, bs = -1;
+      for (const [v, c] of cnt) {
+        const g = colorOf(v);
+        if (!g) continue;
+        const score = Math.sqrt(c) * Math.exp(-shadeDist(px, g) / 10);
+        if (score > bs) { bs = score; best = v; }
+      }
+      if (best >= 0) assign.push([i, best]);
+      else left.push(i);
+    }
+    for (const [i, v] of assign) labels[i] = v;
+    todo = left;
+  }
+  return dissolve.size;
 }

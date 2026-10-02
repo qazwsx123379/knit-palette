@@ -129,9 +129,10 @@ export function createWorkspace(app) {
   // 自動把背景（平滑的桌面）分開成「不換色」，同顏色但有針目紋理的毛線保留下來
   // 回傳分出來的背景佔整張圖的比例
   function autoBackground() {
-    if (S.bgSuspect == null) return 0;
-    const moved = Seg.separateBackground(S.prep, S.labels, S.bgSuspect);
-    if (moved) recompute({ renumber: S.mode === 'detect' });
+    // 只是某種線的暗部、縫、影子的群不是真的線，先交還給旁邊的線，再分背景
+    const dissolved = Seg.dissolveEdgeGroups(S.prep, S.labels);
+    const moved = S.bgSuspect == null ? 0 : Seg.separateBackground(S.prep, S.labels, S.bgSuspect);
+    if (moved || dissolved) recompute({ renumber: S.mode === 'detect' });
     return moved / S.prep.n;
   }
 
